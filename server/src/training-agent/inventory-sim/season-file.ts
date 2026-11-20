@@ -5,8 +5,9 @@
  * 1. A zod pass checks the shape, dates, number ranges and the values tenants put on the wire
  *    (currency code, domains, formats present, floors), with the path of each problem.
  * 2. A reference pass checks what the engine leaves unchecked: product
- *    properties, product collections, the ids traffic events target and,
- *    when the host lists the formats it supports, placement formats.
+ *    properties, product collections, the ids traffic events target, the
+ *    forecast error's channels and publishers and, when the host lists the
+ *    formats it supports, placement formats.
  * 3. The engine's own checks run through `trafficFor` (shares sum to 1, ids
  *    resolve), which also primes the traffic cache for the returned seed. Then
  *    every product must cover some inventory.
@@ -47,6 +48,8 @@ const wholeDays = (min: number) =>
     .number()
     .int(`must be a whole number, ${min} or more`)
     .min(min, `must be a whole number, ${min} or more`);
+const aboveZero = z.number().gt(0, 'must be above 0');
+const zeroToBelowOne = z.number().min(0, 'must be 0 or more and below 1').lt(1, 'must be 0 or more and below 1');
 const rate = z.number().min(0, 'must be between 0 and 1').max(1, 'must be between 0 and 1');
 
 const cellRates = z.strictObject({
@@ -89,6 +92,7 @@ const property = z.strictObject({
   name: z.string(),
   domain: publisherDomain,
   traffic_multiplier: atLeastZero.optional(),
+  publisher_id: z.string().optional(),
 });
 
 const placement = z.strictObject({
@@ -133,6 +137,40 @@ const collection = z.strictObject({
   audience_sigma: atLeastZero,
 });
 
+const publisherForecastError = z.strictObject({
+  publisher_id: z.string(),
+  bias: z.number(),
+  bias_sigma: atLeastZero.optional(),
+  error_scale: atLeastZero.optional(),
+});
+
+const spikes = z
+  .strictObject({
+    per_publisher_min: wholeDays(0),
+    per_publisher_max: wholeDays(0),
+    size_min: z.number().gt(-1, 'must be above -1'),
+    size_max: z.number(),
+    decay: zeroToBelowOne,
+    decay_forecast_sigma: atLeastZero,
+  })
+  .refine(s => !(s.per_publisher_max < s.per_publisher_min), {
+    path: ['per_publisher_max'],
+    message: 'must be at least per_publisher_min',
+  })
+  .refine(s => !(s.size_max < s.size_min), { path: ['size_max'], message: 'must be at least size_min' });
+
+const forecastError = z.strictObject({
+  channel_sigma: z.partialRecord(channel, atLeastZero),
+  ar1_phi: zeroToBelowOne,
+  lead_time_tau_days: aboveZero,
+  lead_time_horizon_days: wholeDays(0),
+  log_clip: aboveZero,
+  cell_kappa: atLeastZero,
+  cell_min_impressions: z.number().min(1, 'must be 1 or more'),
+  publishers: z.array(publisherForecastError).optional(),
+  spikes: spikes.optional(),
+});
+
 const event = z.discriminatedUnion('type', [
   z.strictObject({
     type: z.literal('traffic_multiplier'),
@@ -160,30 +198,42 @@ const event = z.discriminatedUnion('type', [
   }),
 ]);
 
-export const seasonSeedSchema = z.strictObject({
-  seed_id: z.string(),
-  rng_seed: z.string(),
-  start_date: isoDate,
-  days: z.number(),
-  currency: currencyCode,
-  regions: z.array(region),
-  audience_profiles: z.array(audienceProfile),
-  segments: z.array(segment),
-  properties: z.array(property),
-  placements: z.array(placement),
-  products: z.array(product),
-  collections: z.array(collection).optional(),
-  traffic: z.strictObject({
-    weekday_shape: z.array(atLeastZero),
-    trend_per_day: z.number().optional(),
-  }),
-  forecast_error: z.strictObject({
-    bias: z.number().optional(),
-    day_sigma: atLeastZero,
-    cell_sigma: atLeastZero,
-  }),
-  events: z.array(event).optional(),
-});
+export const seasonSeedSchema = z
+  .strictObject({
+    seed_id: z.string(),
+    rng_seed: z.string(),
+    start_date: isoDate,
+    days: z.number(),
+    currency: currencyCode,
+    regions: z.array(region),
+    audience_profiles: z.array(audienceProfile),
+    segments: z.array(segment),
+    properties: z.array(property),
+    placements: z.array(placement),
+    products: z.array(product),
+    collections: z.array(collection).optional(),
+    traffic: z.strictObject({
+      weekday_shape: z.array(atLeastZero),
+      trend_per_day: z.number().optional(),
+      month_shape: z
+        .array(z.number().gt(0, 'must be above 0'))
+        .length(12, 'needs twelve values, January first')
+        .optional(),
+      truth_daily_sigma: atLeastZero.optional(),
+    }),
+    forecast_error: forecastError,
+    events: z.array(event).optional(),
+  })
+  .superRefine((seed, ctx) => {
+    const most = seed.forecast_error.spikes?.per_publisher_max;
+    if (typeof most === 'number' && most > seed.days) {
+      ctx.addIssue({
+        code: 'custom',
+        path: ['forecast_error', 'spikes', 'per_publisher_max'],
+        message: 'must be at most the number of days in the season',
+      });
+    }
+  });
 
 /** Compile-time check that the schema and `SeasonSeed` are the same type,
  * optional fields included: a field added to one and not the other fails
@@ -213,7 +263,8 @@ export interface SeasonFileOptions {
 }
 
 /** References the engine does not resolve: a product's `property_ids` and
- * `collection_ids`, and the ids a traffic event targets. Each would load and
+ * `collection_ids`, the ids a traffic event targets, a channel in use with no
+ * forecast error sigma and a forecast error publisher no property has. Each would load and
  * then match nothing. With `formats`, also placement formats the host does
  * not know. */
 function referenceProblems(seed: SeasonSeed, formats?: ReadonlySet<string>): string[] {
@@ -262,6 +313,21 @@ function referenceProblems(seed: SeasonSeed, formats?: ReadonlySet<string>): str
     check(`events[${i}].property_ids`, event.property_ids, propertyIds, 'property');
     check(`events[${i}].region_ids`, event.region_ids, regionIds, 'region');
   });
+  const unsized = new Set<string>();
+  seed.placements.forEach(placement => {
+    if (seed.forecast_error.channel_sigma[placement.channel] === undefined && !unsized.has(placement.channel)) {
+      unsized.add(placement.channel);
+      problems.push(`forecast_error.channel_sigma.${placement.channel}: needed by placement ${placement.placement_id}`);
+    }
+  });
+  const publisherIds = new Set(seed.properties.map(p => p.publisher_id ?? p.property_id));
+  const listed = new Set<string>();
+  (seed.forecast_error.publishers ?? []).forEach((entry, i) => {
+    const path = `forecast_error.publishers[${i}].publisher_id`;
+    if (!publisherIds.has(entry.publisher_id)) problems.push(`${path}: unknown publisher ${entry.publisher_id}`);
+    else if (listed.has(entry.publisher_id)) problems.push(`${path}: publisher ${entry.publisher_id} is listed twice`);
+    listed.add(entry.publisher_id);
+  });
   if (unsupported && formats) problems.push(`supported formats: ${[...formats].sort().join(', ')}`);
   return problems;
 }
@@ -270,7 +336,14 @@ function referenceProblems(seed: SeasonSeed, formats?: ReadonlySet<string>): str
 export function parseSeasonSeed(input: unknown, source: string, options: SeasonFileOptions = {}): SeasonSeed {
   const parsed = seasonSeedSchema.safeParse(input);
   if (!parsed.success) {
-    invalid(source, parsed.error.issues.map(issue => `${dottedPath(issue.path)}: ${issue.message}`));
+    invalid(
+      source,
+      parsed.error.issues.flatMap(issue =>
+        issue.code === 'unrecognized_keys'
+          ? issue.keys.map(key => `${dottedPath([...issue.path, key])}: unrecognized key`)
+          : [`${dottedPath(issue.path)}: ${issue.message}`],
+      ),
+    );
   }
   const seed: SeasonSeed = parsed.data;
   const problems = referenceProblems(seed, options.formats);

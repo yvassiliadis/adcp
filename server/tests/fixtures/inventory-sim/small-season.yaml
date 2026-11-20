@@ -56,8 +56,19 @@ products:
 traffic:
   weekday_shape: [0.9, 1, 1, 1, 1, 1.05, 0.95]
 
-# How wrong forecasts are versus delivery: bias, plus day-to-day and per-cell noise.
+# How wrong forecasts are versus delivery. The error widens with lead time: a forecast made far ahead is further off.
 forecast_error:
-  bias: 0
-  day_sigma: 0.04
-  cell_sigma: 0.08
+  # Same-day spread of the shared publisher error, per channel; lead time widens it. With cell_kappa 0 and no bias, 0 means forecasts are exact.
+  channel_sigma: { display: 0 }
+  # How strongly one day's error carries into the next, from 0 (independent days) up to but below 1.
+  ar1_phi: 0
+  # Days of lead time that double the error's variance: it widens by sqrt(1 + min(lead time, horizon) / this).
+  lead_time_tau_days: 14
+  # Lead time in days beyond which the error stops widening.
+  lead_time_horizon_days: 60
+  # Largest error a forecast carries in either direction, on a log scale (0.69 is a factor of two).
+  log_clip: 0.6931471805599453
+  # Extra per-cell error that is small on busy cells and large on thin ones. 0 turns it off.
+  cell_kappa: 0
+  # Impressions a cell is treated as having at least when sizing the per-cell error.
+  cell_min_impressions: 100

@@ -263,10 +263,26 @@ describe('inventory tenants', () => {
       expect(g.totals.impressions).toBeGreaterThan(180_000 * 0.97);
       expect(g.totals.impressions).toBeLessThanOrEqual(180_000);
 
-      // Actual traffic differs from the forecast, within the seeded error.
+      // Actual traffic differs from the forecast, within the model's error. The
+      // forecast is read on 2026-12-31 for 30 January days, so lead times run
+      // 1 to 30 days. ln(actual / forecast) over the flight is:
+      //  - the publisher bias, -0.02 on both publishers;
+      //  - the election spike, a scripted truth-only event: 1.8x on Pinnacle
+      //    News for 3 of 30 days, and Pinnacle carries 1 / 1.6 of the pre-roll
+      //    (Summit Sports has traffic_multiplier 0.6), so
+      //    ln(1 + 0.1 * 0.8 * 0.625) = +0.049;
+      //  - the lead-time term, zero-mean: channel_sigma 0.06 x g(h), with
+      //    g(h) = sqrt(1 + h / 14), on an AR(1) with phi 0.85, averaged over 30
+      //    days and over two independent publishers weighted 0.625 / 0.375: sd 0.036;
+      //  - per-cell noise (cell_kappa 3.08 over about 1 000 cell-days), sd
+      //    below 0.005; the daily truth variation sits on both sides of the
+      //    ratio and cancels.
+      // The centre is +0.029 and the bound is three sd either side. The ln 2
+      // log clip is far outside it, so it does not bind.
+      const logError = Math.log(a.totals.impressions / forecastMid);
       expect(a.totals.impressions).not.toBe(forecastMid);
-      expect(Math.abs(a.totals.impressions / forecastMid - 1)).toBeGreaterThan(0.001);
-      expect(Math.abs(a.totals.impressions / forecastMid - 1)).toBeLessThan(0.15);
+      expect(logError).toBeGreaterThan(0.029 - 3 * 0.036);
+      expect(logError).toBeLessThan(0.029 + 3 * 0.036);
       expect(a.totals.spend).toBeCloseTo((a.totals.impressions * 10) / 1000, 0);
     });
 
@@ -578,7 +594,12 @@ describe('inventory tenants', () => {
       const delivery = await call(tenant, 'get_media_buy_delivery', { account: ACCOUNT, media_buy_ids: [buy.media_buy_id] }, CONTENT_TOKEN);
       expectCanonical('get_media_buy_delivery', delivery);
       const delivered = delivery.media_buy_deliveries[0].totals.impressions as number;
-      // Three of the four forecast episodes ran.
+      // Forecasts never know a cancellation, so delivery is the three episodes
+      // that ran over the four forecast: 3 / 4 = 0.75, times the mean of three
+      // audience shocks A_i (audience_sigma 0.12, so sd 0.12 / sqrt(3) = 0.07).
+      // channel_sigma is 0, and per-cell noise (cell_kappa 0.4, about 0.04 per
+      // cell-day) and the daily truth variation average out or cancel. Three sd
+      // is 0.75 x (1 +/- 0.21) = 0.59 to 0.91; the bounds below, 0.6 and 0.9, sit just inside that.
       expect(delivered / forecastMid).toBeGreaterThan(0.6);
       expect(delivered / forecastMid).toBeLessThan(0.9);
       const daily = (delivery.media_buy_deliveries[0].daily_breakdown as Structured[]).filter(row => row.impressions > 0);

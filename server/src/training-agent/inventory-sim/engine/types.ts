@@ -58,6 +58,9 @@ export interface SeedProperty {
   domain: string;
   /** Scales every placement's base traffic on this property. Default 1. */
   traffic_multiplier?: number;
+  /** Groups properties into one publisher for the forecast error: a publisher's
+   * properties share its bias and its spikes. Default: the property's own id. */
+  publisher_id?: string;
 }
 
 export interface SeedPlacement {
@@ -169,13 +172,53 @@ export interface SeasonSeed {
     weekday_shape: number[];
     /** Linear growth per day of the season. Default 0. */
     trend_per_day?: number;
+    /** Twelve multipliers on traffic by calendar month, January first, each above 0. Default all 1. */
+    month_shape?: number[];
+    /** Standard deviation of the log day-to-day wobble of each placement. It is in both actual traffic and the forecast. 0 or more. Default 0. */
+    truth_daily_sigma?: number;
   };
-  /** How wrong forecasts are: actual = forecast × (1 + bias + day noise +
-   * cell noise), with standard deviations as given. */
+  /** How wrong forecasts are, as a log error that grows with lead time. */
   forecast_error: {
-    bias?: number;
-    day_sigma: number;
-    cell_sigma: number;
+    /** Standard deviation, per channel, of the same-day log error shared by a publisher's channels; lead time widens it. 0 or more. Needed for every channel a placement uses. */
+    channel_sigma: Partial<Record<PlacementChannel, number>>;
+    /** Day-to-day correlation of a publisher's error series, shared across its channels, from 0 up to but not including 1. */
+    ar1_phi: number;
+    /** Days of lead time that double the error's variance: it widens by a factor of sqrt(1 + min(lead time, horizon) / this). Above 0. */
+    lead_time_tau_days: number;
+    /** Lead time in days beyond which the error stops growing. A whole number, 0 or more. */
+    lead_time_horizon_days: number;
+    /** Largest log error a forecast carries in either direction. Above 0. */
+    log_clip: number;
+    /** Strength of the per-cell error that is small on busy cells and large on thin ones. 0 or more. */
+    cell_kappa: number;
+    /** Impressions at which a cell counts as busy: a cell expecting fewer is treated as having this many. 1 or more. */
+    cell_min_impressions: number;
+    /** Per-publisher settings. A publisher left out has no bias, bias spread or scale change. */
+    publishers?: Array<{
+      /** A `publisher_id` that at least one property has. Listed once. */
+      publisher_id: string;
+      /** How far actual traffic sits from this publisher's forecasts, as a log offset: negative means actual comes in below the forecast. Forecasts carry -bias. */
+      bias: number;
+      /** Standard deviation of a per-publisher bias drawn around `bias`. 0 or more. Default 0. */
+      bias_sigma?: number;
+      /** Multiplier on this publisher's error spread. 0 or more. Default 1. */
+      error_scale?: number;
+    }>;
+    /** Sudden surges and slumps in actual traffic that decay over days. */
+    spikes?: {
+      /** Fewest spikes a publisher has over the season. A whole number, 0 or more. */
+      per_publisher_min: number;
+      /** Most spikes a publisher has over the season. A whole number, at least the minimum and at most `days`. */
+      per_publisher_max: number;
+      /** Smallest relative size of a spike, above -1 (-0.5 is a 50% slump). */
+      size_min: number;
+      /** Largest relative size of a spike, at least `size_min`. */
+      size_max: number;
+      /** Share of a spike left each day after it starts, from 0 up to but not including 1. */
+      decay: number;
+      /** Standard deviation of the log error with which forecasts see a spike's decay. 0 or more. */
+      decay_forecast_sigma: number;
+    };
   };
   events?: SeasonEvent[];
 }
