@@ -28,7 +28,7 @@ import {
   type GoalRequest,
 } from './allocation.js';
 import { EngineError } from './errors.js';
-import { trafficFor, isInstallmentChannel, type SeasonTraffic } from './traffic.js';
+import { trafficFor, type SeasonTraffic } from './traffic.js';
 import type {
   Booking,
   BookingDay,
@@ -87,13 +87,15 @@ export interface ForecastResult extends DeliveryMetrics {
   /** Of those, reserved by guaranteed bookings. */
   booked: number;
   available: number;
-  /** Expected impressions: available, or what the budget buys if less.
-   * Equal to `impressions`. */
+  /** Lower end of the band: built on capacity, net of bookings, and capped at
+   * what the budget buys. */
   low: number;
+  /** Upper end of the band, built the same way as `low`. */
   high: number;
   /** Price used for spend: the product's rate, or the bid. */
   cpm?: number;
-  /** Relative spread used for low and high. */
+  /** Standard deviation of the log forecast; low and high sit `RANGE_Z` of
+   * these either side of capacity, capped at the season's `log_clip`. */
   sigma: number;
 }
 
@@ -379,9 +381,24 @@ export class InventorySimulation {
     return record;
   }
 
+  /** `F(cell, day)` as known on `asOfDay`, computed once per cell and day for the life of the reader. */
+  private forecastReader(asOfDay: number): (day: number, cell: number) => number {
+    const memo = new Map<number, number>();
+    const stride = this.traffic.slots.length;
+    return (day, cell) => {
+      const key = day * stride + cell;
+      let value = memo.get(key);
+      if (value === undefined) {
+        value = this.traffic.forecastValue(day, cell, asOfDay);
+        memo.set(key, value);
+      }
+      return value;
+    };
+  }
+
   /** Reserved impressions per day and cell, from the guaranteed bookings
    * still to serve after `today`. */
-  private reservations(fromDay: number): Map<number, CellCounts> {
+  private reservations(fromDay: number, forecastOf: (day: number, cell: number) => number): Map<number, CellCounts> {
     const reserved = new Map<number, CellCounts>();
     const add = (day: number, cell: number, value: number) => {
       let counts = reserved.get(day);
@@ -395,37 +412,96 @@ export class InventorySimulation {
       const cells = this.cellsFor(booking);
       if (booking.kind === 'share_of_voice') {
         for (let day = first; day < last; day++) {
-          const forecast = this.traffic.day(day).forecast;
-          for (const cell of cells) add(day, cell, (booking.share_of_voice ?? 0) * (forecast.get(cell) ?? 0));
+          for (const cell of cells) add(day, cell, (booking.share_of_voice ?? 0) * forecastOf(day, cell));
         }
         continue;
       }
       const left = Math.max(0, (booking.impression_goal ?? 0) - booking.delivered.impressions);
       let total = 0;
-      for (let day = first; day < last; day++) total += supplyOf(this.traffic.day(day).forecast, cells);
+      for (let day = first; day < last; day++) for (const cell of cells) total += forecastOf(day, cell);
       if (total === 0 || left === 0) continue;
       const share = Math.min(1, left / total);
       for (let day = first; day < last; day++) {
-        const forecast = this.traffic.day(day).forecast;
-        for (const cell of cells) add(day, cell, share * (forecast.get(cell) ?? 0));
+        for (const cell of cells) add(day, cell, share * forecastOf(day, cell));
       }
     }
     return reserved;
   }
 
   /**
+   * Variance of the log forecast over `cells` and the days `first` to `last`
+   * (exclusive), as seen on `asOfDay`. Four independent terms, each over the
+   * square of total forecast traffic:
+   *  - the publisher error, correlated across days by an AR(1) with the
+   *    season's `ar1_phi` and fully correlated across the cells of a day;
+   *  - the per-cell error, independent per cell and day;
+   *  - the audience error of each installment, fully correlated across its days;
+   *  - the spread of the spike tails already started, taken as fully
+   *    correlated across both cells and days (the conservative reading).
+   * Within a day, publishers are treated as fully correlated.
+   * The publisher term sums `a_t a_t' φ^|t−t'|` in one pass: `carry` holds
+   * `Σ_{t' ≤ t} a_t' φ^(t−t')`.
+   */
+  private forecastLogVariance(
+    cells: readonly number[],
+    first: number,
+    last: number,
+    asOfDay: number,
+    forecastOf: (day: number, cell: number) => number,
+  ): number {
+    const { traffic } = this;
+    const phi = this.seed.forecast_error.ar1_phi;
+    const audience = new Map<string, number>();
+    let total = 0;
+    let publisher = 0;
+    let carry = 0;
+    let perCell = 0;
+    let spiked = 0;
+    for (let day = first; day < last; day++) {
+      let weight = 0;
+      let weighted = 0;
+      let daySpiked = 0;
+      for (const cell of cells) {
+        const value = forecastOf(day, cell);
+        if (value === 0) continue;
+        const sigmas = traffic.errorSigmas(day, cell, asOfDay);
+        weight += value;
+        weighted += value * sigmas.publisher;
+        perCell += (value * sigmas.cell) ** 2;
+        daySpiked += value * traffic.spikeTailSpread(day, cell, asOfDay);
+        const installmentId = traffic.slots[cell].installment_id;
+        if (installmentId !== undefined) audience.set(installmentId, (audience.get(installmentId) ?? 0) + value);
+      }
+      total += weight;
+      publisher += weighted * (weighted + 2 * phi * carry);
+      carry = phi * carry + weighted;
+      spiked += daySpiked;
+    }
+    if (total === 0) return 0;
+    let audienceTerm = 0;
+    for (const [installmentId, value] of audience) {
+      const collection = traffic.collections.get(traffic.installment(installmentId)!.collection_id)!;
+      audienceTerm += (value * collection.audience_sigma) ** 2;
+    }
+    return (publisher + perCell + audienceTerm + spiked ** 2) / (total * total);
+  }
+
+  /**
    * Forecast traffic over the cells a product covers, minus what guaranteed
    * bookings have reserved. Days start no earlier than tomorrow, the first
-   * day a booking made now could serve.
+   * day a booking made now could serve. Forecasts are read as of today, so
+   * the same flight narrows and shifts as the clock moves.
    */
   forecast(query: ForecastQuery, nowMs: number): ForecastResult {
     this.advanceTo(nowMs);
     const product = this.traffic.requireProduct(query.product_id);
     const { start, end } = this.flightDays(query.flight_start_ms, query.flight_end_ms);
     const cells = this.traffic.eligibleCells(product.product_id, query.targeting);
-    const first = Math.max(start, this.today(nowMs) + 1, 0);
+    const asOfDay = this.today(nowMs);
+    const first = Math.max(start, asOfDay + 1, 0);
     const last = Math.min(end, this.traffic.calendar.days);
-    const reserved = this.reservations(first);
+    const forecastOf = this.forecastReader(asOfDay);
+    const reserved = this.reservations(first, forecastOf);
     let capacity = 0;
     let booked = 0;
     let clicks = 0;
@@ -433,10 +509,9 @@ export class InventorySimulation {
     let completed = 0;
     let conversions = 0;
     for (let day = first; day < last; day++) {
-      const forecast = this.traffic.day(day).forecast;
       const held = reserved.get(day);
       for (const cell of cells) {
-        const value = forecast.get(cell) ?? 0;
+        const value = forecastOf(day, cell);
         if (value === 0) continue;
         const taken = Math.min(value, held?.get(cell) ?? 0);
         const free = value - taken;
@@ -455,7 +530,9 @@ export class InventorySimulation {
     const affordable = query.budget !== undefined && cpm ? Math.floor((query.budget * 1000) / cpm) : Number.POSITIVE_INFINITY;
     const impressions = Math.min(available, affordable);
     const scale = available > 0 ? impressions / available : 0;
-    const sigma = this.forecastSigma(product.product_id);
+    const sigma = Math.sqrt(this.forecastLogVariance(cells, first, last, asOfDay, forecastOf));
+    const halfWidth = Math.min(RANGE_Z * sigma, this.seed.forecast_error.log_clip);
+    const bound = (factor: number) => Math.round(Math.min(affordable, Math.max(0, capacity * factor - booked)));
     return {
       product_id: product.product_id,
       currency: this.seed.currency,
@@ -465,8 +542,8 @@ export class InventorySimulation {
       booked: Math.round(booked),
       available,
       impressions,
-      low: Math.round(impressions * Math.max(0, 1 - RANGE_Z * sigma)),
-      high: Math.round(impressions * (1 + RANGE_Z * sigma)),
+      low: bound(Math.exp(-halfWidth)),
+      high: bound(Math.exp(halfWidth)),
       spend: cpm ? roundMoney((impressions * cpm) / 1000) : 0,
       clicks: Math.round(clicks * scale),
       viewable_impressions: Math.round(viewable * scale),
@@ -475,16 +552,6 @@ export class InventorySimulation {
       ...(cpm !== undefined && { cpm }),
       sigma,
     };
-  }
-
-  private forecastSigma(productId: string): number {
-    const product = this.traffic.requireProduct(productId);
-    const sigmas = product.placement_ids.map(id => {
-      const placement = this.traffic.placements.get(id)!;
-      if (!isInstallmentChannel(placement.channel)) return this.seed.forecast_error.day_sigma;
-      return Math.max(0, ...(product.collection_ids ?? []).map(cid => this.traffic.collections.get(cid)!.audience_sigma));
-    });
-    return Math.max(...sigmas);
   }
 
   /**

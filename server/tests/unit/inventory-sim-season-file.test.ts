@@ -12,6 +12,7 @@ import {
   CONTENT_SEASON,
   EngineError,
   InventorySimulation,
+  SeasonTraffic,
   type SeasonSeed,
 } from '../../src/training-agent/inventory-sim/engine/index.js';
 import {
@@ -93,8 +94,13 @@ products:
 traffic:
   weekday_shape: [1, 1, 1, 1, 1, 1, 1]
 forecast_error:
-  day_sigma: 0.05
-  cell_sigma: 0.1
+  channel_sigma: { display: 0.05 }
+  ar1_phi: 0.5
+  lead_time_tau_days: 14
+  lead_time_horizon_days: 60
+  log_clip: 0.6931471805599453
+  cell_kappa: 0.5
+  cell_min_impressions: 100
 `;
 
 describe('season files', () => {
@@ -315,6 +321,7 @@ describe('season number ranges', () => {
     expected_audience: 1000,
     audience_sigma: 0.1,
   };
+  const SPIKES = { per_publisher_min: 1, per_publisher_max: 3, size_min: 0.2, size_max: 0.8, decay: 0.7, decay_forecast_sigma: 0.1 };
   /* eslint-disable @typescript-eslint/no-explicit-any */
   const cases: Array<[string, (seed: any) => void, string]> = [
     ['a negative reporting lag', s => { s.placements[0].reporting_lag_days = -1; }, 'placements[0].reporting_lag_days:'],
@@ -332,8 +339,29 @@ describe('season number ranges', () => {
     ['a negative rate multiplier', s => { s.audience_profiles[0].rate_multipliers.click_rate = -1; }, 'audience_profiles[0].rate_multipliers.click_rate:'],
     ['a negative weekday shape', s => { s.traffic.weekday_shape[3] = -1; }, 'traffic.weekday_shape[3]:'],
     ['a negative traffic multiplier', s => { s.properties[0].traffic_multiplier = -1; }, 'properties[0].traffic_multiplier:'],
-    ['a negative day sigma', s => { s.forecast_error.day_sigma = -0.1; }, 'forecast_error.day_sigma:'],
-    ['a negative cell sigma', s => { s.forecast_error.cell_sigma = -0.1; }, 'forecast_error.cell_sigma:'],
+    ['a negative channel sigma', s => { s.forecast_error.channel_sigma.display = -0.1; }, 'forecast_error.channel_sigma.display:'],
+    ['an ar1_phi of 1', s => { s.forecast_error.ar1_phi = 1; }, 'forecast_error.ar1_phi:'],
+    ['a negative ar1_phi', s => { s.forecast_error.ar1_phi = -0.1; }, 'forecast_error.ar1_phi:'],
+    ['a zero lead_time_tau_days', s => { s.forecast_error.lead_time_tau_days = 0; }, 'forecast_error.lead_time_tau_days:'],
+    ['a negative lead_time_horizon_days', s => { s.forecast_error.lead_time_horizon_days = -1; }, 'forecast_error.lead_time_horizon_days:'],
+    ['a fractional lead_time_horizon_days', s => { s.forecast_error.lead_time_horizon_days = 1.5; }, 'forecast_error.lead_time_horizon_days:'],
+    ['a zero log_clip', s => { s.forecast_error.log_clip = 0; }, 'forecast_error.log_clip:'],
+    ['a negative cell_kappa', s => { s.forecast_error.cell_kappa = -1; }, 'forecast_error.cell_kappa:'],
+    ['a cell_min_impressions below 1', s => { s.forecast_error.cell_min_impressions = 0.5; }, 'forecast_error.cell_min_impressions:'],
+    ['a negative truth_daily_sigma', s => { s.traffic.truth_daily_sigma = -0.1; }, 'traffic.truth_daily_sigma:'],
+    ['a month_shape of eleven values', s => { s.traffic.month_shape = Array(11).fill(1); }, 'traffic.month_shape'],
+    ['a month_shape with a zero', s => { s.traffic.month_shape = [1, 1, 0, 1, 1, 1, 1, 1, 1, 1, 1, 1]; }, 'traffic.month_shape[2]'],
+    ['a negative bias_sigma', s => { s.forecast_error.publishers = [{ publisher_id: 'harbor_daily', bias: 0, bias_sigma: -1 }]; }, 'forecast_error.publishers[0].bias_sigma:'],
+    ['a negative error_scale', s => { s.forecast_error.publishers = [{ publisher_id: 'harbor_daily', bias: 0, error_scale: -1 }]; }, 'forecast_error.publishers[0].error_scale:'],
+    ['a negative per_publisher_min', s => { s.forecast_error.spikes = { ...SPIKES, per_publisher_min: -1 }; }, 'forecast_error.spikes.per_publisher_min:'],
+    ['a size_min of -1', s => { s.forecast_error.spikes = { ...SPIKES, size_min: -1 }; }, 'forecast_error.spikes.size_min:'],
+    ['a per_publisher_min above per_publisher_max', s => { s.forecast_error.spikes = { ...SPIKES, per_publisher_min: 4, per_publisher_max: 3 }; }, 'forecast_error.spikes.per_publisher_max:'],
+    ['a size_min above size_max', s => { s.forecast_error.spikes = { ...SPIKES, size_min: 1, size_max: 0.5 }; }, 'forecast_error.spikes.size_max:'],
+    ['a per_publisher_max above the days', s => { s.forecast_error.spikes = { ...SPIKES, per_publisher_max: 366 }; }, 'forecast_error.spikes.per_publisher_max:'],
+    ['a spike decay of 1', s => { s.forecast_error.spikes = { ...SPIKES, decay: 1 }; }, 'forecast_error.spikes.decay:'],
+    ['a negative decay_forecast_sigma', s => { s.forecast_error.spikes = { ...SPIKES, decay_forecast_sigma: -1 }; }, 'forecast_error.spikes.decay_forecast_sigma:'],
+    ['a publisher no property has', s => { s.forecast_error.publishers = [{ publisher_id: 'nobody', bias: 0 }]; }, 'forecast_error.publishers[0].publisher_id: unknown publisher nobody'],
+    ['a publisher listed twice', s => { s.forecast_error.publishers = [{ publisher_id: 'harbor_daily', bias: 0 }, { publisher_id: 'harbor_daily', bias: 0.1 }]; }, 'forecast_error.publishers[1].publisher_id'],
   ];
   /* eslint-enable @typescript-eslint/no-explicit-any */
 
@@ -359,9 +387,87 @@ describe('season number ranges', () => {
     seed.placements[0].reporting_lag_days = 0;
     seed.placements[0].rates.click_rate = 1;
     seed.products[0].share_of_voice = 1;
-    seed.forecast_error.bias = -5;
+    seed.forecast_error.publishers = [{ publisher_id: 'harbor_daily', bias: -5, bias_sigma: 0, error_scale: 0 }];
+    seed.forecast_error.ar1_phi = 0;
+    seed.forecast_error.lead_time_horizon_days = 0;
+    seed.forecast_error.cell_min_impressions = 1;
+    seed.forecast_error.channel_sigma.display = 0;
+    seed.traffic.truth_daily_sigma = 0;
     seed.traffic.trend_per_day = -0.01;
     expect(() => parseSeasonSeed(seed, 'ranges')).not.toThrow();
+  });
+
+  it('accepts spikes at their bounds', () => {
+    const seed = parseYaml(fs.readFileSync(starterPath, 'utf8'));
+    seed.forecast_error.spikes = { per_publisher_min: 0, per_publisher_max: 365, size_min: -0.99, size_max: -0.99, decay: 0, decay_forecast_sigma: 0 };
+    expect(() => parseSeasonSeed(seed, 'ranges')).not.toThrow();
+  });
+});
+
+describe('forecast error values', () => {
+  it('names the old keys and the missing channel_sigma', () => {
+    const seed = parseYaml(MINIMAL_YAML);
+    seed.forecast_error = { day_sigma: 0.05, ar1_phi: 0.5, lead_time_tau_days: 14, lead_time_horizon_days: 60, log_clip: 0.7, cell_kappa: 0, cell_min_impressions: 100 };
+    const message = invalidSeedMessage(() => parseSeasonSeed(seed, 'old'));
+    expect(message).toContain('forecast_error.day_sigma');
+    expect(message).toContain('forecast_error.channel_sigma');
+  });
+
+  it('refuses a placement channel with no channel_sigma, in the loader and in the engine', () => {
+    const seed = parseYaml(MINIMAL_YAML);
+    seed.placements.push({ ...seed.placements[0], placement_id: 'show_spot', channel: 'podcast' });
+    const message = invalidSeedMessage(() => parseSeasonSeed(seed, 'podcast'));
+    expect(message).toContain('forecast_error.channel_sigma.podcast');
+    expect(message).toContain('show_spot');
+    expect(invalidSeedMessage(() => new SeasonTraffic(seed))).toContain('forecast_error.channel_sigma.podcast');
+  });
+
+  it('refuses a channel_sigma key that is not a channel, naming the path', () => {
+    const seed = parseYaml(MINIMAL_YAML);
+    seed.forecast_error.channel_sigma.radio = 0.1;
+    const message = invalidSeedMessage(() => parseSeasonSeed(seed, 'unknown channel'));
+    expect(message).toContain('forecast_error.channel_sigma');
+    expect(message).toContain('forecast_error.channel_sigma.radio');
+  });
+
+  it('keeps the supported-formats line last with the forecast error problems', () => {
+    const seed = parseYaml(MINIMAL_YAML);
+    seed.forecast_error.publishers = [{ publisher_id: 'nobody', bias: 0 }];
+    seed.placements[0].formats = ['custom_banner'];
+    const lines = invalidSeedMessage(() => parseSeasonSeed(seed, 'both', { formats: new Set(['display_300x250']) })).trim().split('\n');
+    expect(lines.some(line => line.includes('unknown publisher nobody'))).toBe(true);
+    expect(lines[lines.length - 1]).toContain('supported formats:');
+  });
+
+  it('groups properties into a publisher by publisher_id', () => {
+    const seed = parseYaml(MINIMAL_YAML);
+    seed.properties.push({ property_id: 'site_b', name: 'Site B', domain: 'site-b.example', publisher_id: 'house' });
+    seed.forecast_error.publishers = [{ publisher_id: 'house', bias: 0.1 }, { publisher_id: 'site', bias: 0.2 }];
+    expect(() => parseSeasonSeed(seed, 'groups')).not.toThrow();
+  });
+
+  /* eslint-disable @typescript-eslint/no-explicit-any */
+  const engineCases: Array<[string, (seed: any) => void, string]> = [
+    ['a missing ar1_phi', s => { delete s.forecast_error.ar1_phi; }, 'forecast_error.ar1_phi'],
+    ['a missing channel_sigma', s => { delete s.forecast_error.channel_sigma; }, 'forecast_error.channel_sigma'],
+    ['a NaN sigma', s => { s.forecast_error.channel_sigma.display = NaN; }, 'forecast_error.channel_sigma.display'],
+    ['a missing lead_time_tau_days', s => { delete s.forecast_error.lead_time_tau_days; }, 'forecast_error.lead_time_tau_days'],
+    ['a missing lead_time_horizon_days', s => { delete s.forecast_error.lead_time_horizon_days; }, 'forecast_error.lead_time_horizon_days'],
+    ['a missing log_clip', s => { delete s.forecast_error.log_clip; }, 'forecast_error.log_clip'],
+    ['a missing cell_kappa', s => { delete s.forecast_error.cell_kappa; }, 'forecast_error.cell_kappa'],
+    ['a missing cell_min_impressions', s => { delete s.forecast_error.cell_min_impressions; }, 'forecast_error.cell_min_impressions'],
+    ['a month_shape of eleven values', s => { s.traffic.month_shape = Array(11).fill(1); }, 'traffic.month_shape'],
+    ['a negative truth_daily_sigma', s => { s.traffic.truth_daily_sigma = -1; }, 'traffic.truth_daily_sigma'],
+    ['an unknown publisher', s => { s.forecast_error.publishers = [{ publisher_id: 'nobody', bias: 0 }]; }, 'forecast_error.publishers[0]'],
+    ['a publisher listed twice', s => { s.forecast_error.publishers = [{ publisher_id: 'site', bias: 0 }, { publisher_id: 'site', bias: 0 }]; }, 'forecast_error.publishers[1]'],
+    ['an invalid spikes block', s => { s.forecast_error.spikes = { per_publisher_min: 2, per_publisher_max: 1, size_min: 0, size_max: 1, decay: 0.5, decay_forecast_sigma: 0 }; }, 'forecast_error.spikes.per_publisher_max'],
+  ];
+  /* eslint-enable @typescript-eslint/no-explicit-any */
+
+  it.each(engineCases)('makes the engine refuse %s instead of producing NaN', (_name, mutate, where) => {
+    const seed = parseYaml(MINIMAL_YAML);
+    mutate(seed);
+    expect(invalidSeedMessage(() => new SeasonTraffic(seed))).toContain(where);
   });
 });
 
