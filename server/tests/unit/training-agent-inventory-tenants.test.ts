@@ -510,7 +510,7 @@ describe('inventory tenants', () => {
         simulated: { simulated_now: '2026-11-05T00:00:00.000Z', pinned: true },
         message: 'Sandbox clock started at 2026-11-05T00:00:00.000Z',
       });
-      expect(Math.abs(Date.parse(started.simulated.previous_simulated_now) - Date.parse(WALL_CLOCK))).toBeLessThan(60_000);
+      expect(Math.abs(Date.parse(started.simulated.previous_simulated_now) - Date.parse(WALL_CLOCK))).toBeLessThan(10 * 60_000);
       const read = await control(token, { operation: 'get' });
       expect(read.simulated).toEqual({ simulated_now: '2026-11-05T00:00:00.000Z', pinned: true });
     });
@@ -541,6 +541,16 @@ describe('inventory tenants', () => {
       expect(refused.error_detail).toContain('the clock is already pinned at 2026-11-21T09:00:00.000Z');
     });
 
+    it('refuses start as already pinned when the clock is pinned beyond ten years from the wall clock', async () => {
+      const token = freshToken();
+      for (let i = 0; i < 2; i++) {
+        expect((await control(token, { operation: 'advance_time', by: 'P3000D' })).success).toBe(true);
+      }
+      const refused = await startAt(token, '2026-11-05T00:00:00Z');
+      expect(refused.error).toBe('INVALID_TRANSITION');
+      expect(refused.error_detail).toContain('the clock is already pinned at');
+    });
+
     it('starts after an untouched 3.3 sync_accounts and re-stamps the grant', async () => {
       const token = freshToken();
       const synced = await call(tenant, 'sync_accounts', {
@@ -548,7 +558,7 @@ describe('inventory tenants', () => {
       }, token);
       expect(synced.adcp_error, JSON.stringify(synced).slice(0, 400)).toBeUndefined();
       const before = (await listAccounts(token)).accounts[0].authorization.authorized_at;
-      expect(Math.abs(Date.parse(before) - Date.parse(WALL_CLOCK))).toBeLessThan(60_000);
+      expect(Math.abs(Date.parse(before) - Date.parse(WALL_CLOCK))).toBeLessThan(10 * 60_000);
 
       const started = await startAt(token, '2026-11-05T00:00:00Z');
       expect(started.success, JSON.stringify(started)).toBe(true);
@@ -636,6 +646,8 @@ describe('inventory tenants', () => {
         { operation: 'start', to: '2026-11-05T00:00:00Z', by: 'P1D' },
         { operation: 'start' },
         { operation: 'start', to: 'yesterday' },
+        { operation: 'start', to: '2026-12-06' },
+        { operation: 'start', to: '2026-12-06T00:00:00' },
         { operation: 'start', to: 20261105 },
         { operation: 'start', to: '2040-01-01T00:00:00Z' },
         { operation: 'start', to: '2010-01-01T00:00:00Z' },

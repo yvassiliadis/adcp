@@ -68,13 +68,15 @@ function grantUntouched(grant: GrantRecord): boolean {
 /**
  * Claim the caller's sandbox for a clock start. Returns why it cannot be
  * claimed, or undefined when it can.
+ *
  * Grants, timezone changes and markets are stamped from the clock, and a clock
  * moved behind a stamp leaves it in the future. A sandbox is unused while the
  * clock is unpinned, no timezone changed, every grant is untouched and no
  * inventory tenant holds the caller's buys, creatives or seeded products.
- * Claiming it also clears state: the untouched grants (recreated at the started clock on the next
- * account read) and empty stored markets are removed from the document and the
- * store; the caller saves the document.
+ *
+ * Claiming it also clears state: the untouched grants (recreated at the
+ * started clock on the next account read) and empty stored markets are removed
+ * from the document and the store. The caller saves the document.
  */
 async function claimUnusedSandbox(sandbox: LoadedSandbox, principal: string | undefined): Promise<string | undefined> {
   const { doc } = sandbox;
