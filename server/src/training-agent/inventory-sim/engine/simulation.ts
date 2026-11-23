@@ -148,6 +148,8 @@ function overlaps(a: readonly number[], b: ReadonlySet<number>): boolean {
 export class InventorySimulation {
   readonly traffic: SeasonTraffic;
   private readonly cellCache = new Map<string, number[]>();
+  private revision = 0;
+  private reservationMemo?: { day: number; revision: number; reserved: Map<number, CellCounts> };
 
   /** `products` are sold beside the seed's own, on its placements. */
   constructor(readonly seed: SeasonSeed, readonly state: SimulationState, products: readonly SeedProduct[] = []) {
@@ -257,6 +259,7 @@ export class InventorySimulation {
     }
     this.cellCache.set(booking.booking_id, cells);
     this.state.bookings.push(booking);
+    this.revision += 1;
     return booking;
   }
 
@@ -278,6 +281,7 @@ export class InventorySimulation {
       booking.flight_end_day = end;
     }
     if (patch.status !== undefined) booking.status = patch.status;
+    this.revision += 1;
     return booking;
   }
 
@@ -299,7 +303,7 @@ export class InventorySimulation {
     for (const booking of serving.filter(b => b.kind === 'goal')) {
       const left = Math.max(0, (booking.impression_goal ?? 0) - booking.delivered.impressions);
       const daysLeft = booking.flight_end_day - day;
-      const affordable = Math.floor(((booking.budget - booking.delivered.spend) * 1000) / booking.cpm + 1e-9);
+      const affordable = this.affordableImpressions(booking);
       const target = Math.max(0, Math.min(Math.ceil(left / daysLeft), affordable));
       targets.set(booking.booking_id, target);
       goals.push({ id: booking.booking_id, cells: this.cellsFor(booking), target });
@@ -381,37 +385,76 @@ export class InventorySimulation {
     return record;
   }
 
-  /** Reserved impressions per day and cell, from the guaranteed bookings
-   * still to serve after `today`. */
-  private reservations(fromDay: number): Map<number, CellCounts> {
+  /** Impressions the booking's remaining budget buys at its rate. */
+  private affordableImpressions(booking: Booking): number {
+    return Math.floor(((booking.budget - booking.delivered.spend) * 1000) / booking.cpm + 1e-9);
+  }
+
+  /**
+   * Reserved impressions per day and cell, from every live guaranteed
+   * booking over the days it still has to serve, built in delivery order:
+   * share-of-voice first, then goals from the most constrained to the least.
+   * Each goal takes a share of what the bookings before it left, so
+   * overlapping bookings never reserve the same impression twice. The
+   * result does not depend on the forecast query.
+   *
+   * `forecastOf` reads forecast traffic for a day and cell. The default
+   * reader is memoized until a day runs or a booking changes.
+   */
+  private reservations(forecastOf?: (day: number, cell: number) => number): Map<number, CellCounts> {
+    const memoize = forecastOf === undefined;
+    const memo = this.reservationMemo;
+    if (memoize && memo && memo.day === this.state.processed_through_day && memo.revision === this.revision) {
+      return memo.reserved;
+    }
+    const read = forecastOf ?? ((day: number, cell: number) => this.traffic.day(day).forecast.get(cell) ?? 0);
     const reserved = new Map<number, CellCounts>();
-    const add = (day: number, cell: number, value: number) => {
+    const held = (day: number, cell: number) => reserved.get(day)?.get(cell) ?? 0;
+    const residual = (day: number, cell: number) => Math.max(0, read(day, cell) - held(day, cell));
+    const reserve = (day: number, cell: number, value: number) => {
       let counts = reserved.get(day);
       if (!counts) reserved.set(day, (counts = new Map()));
       counts.set(cell, (counts.get(cell) ?? 0) + value);
     };
-    for (const booking of this.state.bookings) {
-      if (booking.status === 'canceled' || booking.kind === 'auction') continue;
-      const first = Math.max(fromDay, booking.confirmed_day + 1, booking.flight_start_day, 0);
-      const last = Math.min(booking.flight_end_day, this.traffic.calendar.days);
-      const cells = this.cellsFor(booking);
-      if (booking.kind === 'share_of_voice') {
-        for (let day = first; day < last; day++) {
-          const forecast = this.traffic.day(day).forecast;
-          for (const cell of cells) add(day, cell, (booking.share_of_voice ?? 0) * (forecast.get(cell) ?? 0));
-        }
-        continue;
-      }
-      const left = Math.max(0, (booking.impression_goal ?? 0) - booking.delivered.impressions);
-      let total = 0;
-      for (let day = first; day < last; day++) total += supplyOf(this.traffic.day(day).forecast, cells);
-      if (total === 0 || left === 0) continue;
-      const share = Math.min(1, left / total);
+    const lastDay = this.traffic.calendar.days;
+    const live = this.state.bookings
+      .filter(booking => booking.status !== 'canceled' && booking.kind !== 'auction')
+      .map(booking => ({
+        booking,
+        cells: this.cellsFor(booking),
+        first: Math.max(this.state.processed_through_day, booking.confirmed_day + 1, booking.flight_start_day, 0),
+        last: Math.min(booking.flight_end_day, lastDay),
+      }))
+      .sort((a, b) => (a.booking.booking_id < b.booking.booking_id ? -1 : a.booking.booking_id > b.booking.booking_id ? 1 : 0));
+
+    for (const { booking, cells, first, last } of live) {
+      if (booking.kind !== 'share_of_voice') continue;
       for (let day = first; day < last; day++) {
-        const forecast = this.traffic.day(day).forecast;
-        for (const cell of cells) add(day, cell, share * (forecast.get(cell) ?? 0));
+        for (const cell of cells) reserve(day, cell, (booking.share_of_voice ?? 0) * read(day, cell));
       }
     }
+
+    const supplyOver = (cells: readonly number[], first: number, last: number) => {
+      let sum = 0;
+      for (let day = first; day < last; day++) for (const cell of cells) sum += residual(day, cell);
+      return sum;
+    };
+    const goals = live
+      .filter(entry => entry.booking.kind === 'goal' && entry.last > entry.first)
+      .map(entry => ({ ...entry, meanDaily: supplyOver(entry.cells, entry.first, entry.last) / (entry.last - entry.first) }))
+      .sort((a, b) => a.meanDaily - b.meanDaily);
+
+    for (const { booking, cells, first, last } of goals) {
+      const left = Math.min(Math.max(0, (booking.impression_goal ?? 0) - booking.delivered.impressions), this.affordableImpressions(booking));
+      const total = supplyOver(cells, first, last);
+      if (total === 0 || left <= 0) continue;
+      const share = Math.min(1, left / total);
+      for (let day = first; day < last; day++) {
+        for (const cell of cells) reserve(day, cell, share * residual(day, cell));
+      }
+    }
+
+    if (memoize) this.reservationMemo = { day: this.state.processed_through_day, revision: this.revision, reserved };
     return reserved;
   }
 
@@ -427,7 +470,7 @@ export class InventorySimulation {
     const cells = this.traffic.eligibleCells(product.product_id, query.targeting);
     const first = Math.max(start, this.today(nowMs) + 1, 0);
     const last = Math.min(end, this.traffic.calendar.days);
-    const reserved = this.reservations(first);
+    const reserved = this.reservations();
     let capacity = 0;
     let booked = 0;
     let clicks = 0;

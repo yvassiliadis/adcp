@@ -330,6 +330,94 @@ describe('simulation', () => {
   });
 });
 
+describe('forecast reservations', () => {
+  const now = at('2026-12-31T12:00:00Z');
+  const flight = { flight_start_ms: at('2027-01-01T00:00:00Z'), flight_end_ms: at('2027-01-31T00:00:00Z') };
+  const segment = { segment_ids: ['s1'] };
+  const query = (sim: InventorySimulation, product_id: string, window: Partial<typeof flight> = {}, targeting?: { segment_ids: string[] }, at_ = now) =>
+    sim.forecast({ product_id, ...flight, ...window, ...(targeting && { targeting }) }, at_);
+  const bookSegment = (sim: InventorySimulation, goal: number, window: Partial<typeof flight> = {}) =>
+    sim.book({ booking_id: 'seg', product_id: 'banner_guaranteed', targeting: segment, ...flight, ...window, budget: 100_000, impression_goal: goal }, now);
+  const bookRos = (sim: InventorySimulation, goal: number, window: Partial<typeof flight> = {}, budget = 100_000) =>
+    sim.book({ booking_id: 'ros', product_id: 'banner_guaranteed', ...flight, ...window, budget, impression_goal: goal }, now);
+
+  it.each([['segment first'], ['run-of-site first']])('reserves overlapping guarantees once, %s', order => {
+    const sim = InventorySimulation.create(scarceSeed(), now);
+    const capacity = query(sim, 'banner_guaranteed').capacity;
+    const book = order === 'segment first'
+      ? [() => bookSegment(sim, capacity * 0.6), () => bookRos(sim, capacity * 0.4)]
+      : [() => bookRos(sim, capacity * 0.4), () => bookSegment(sim, capacity * 0.6)];
+    book.forEach(fn => fn());
+    for (const result of [query(sim, 'banner_guaranteed'), query(sim, 'banner_auction')]) {
+      expect(result.available).toBe(0);
+      expect(result.booked).toBe(result.capacity);
+    }
+    expect(query(sim, 'banner_guaranteed', {}, segment).available).toBe(0);
+  });
+
+  it('reserves a narrow, long guarantee ahead of a wide, short one', () => {
+    const sim = InventorySimulation.create(scarceSeed(), now);
+    const short = { flight_end_ms: at('2027-01-06T00:00:00Z') };
+    const shortCapacity = query(sim, 'banner_guaranteed', short).capacity;
+    bookSegment(sim, 100_000);
+    bookRos(sim, shortCapacity, short);
+    expect(query(sim, 'banner_guaranteed', short).available).toBe(0);
+    const rest = query(sim, 'banner_guaranteed', { flight_start_ms: at('2027-01-06T00:00:00Z') });
+    // The segment's 100,000 spreads over its 30 days, 25 of them after the short flight.
+    expect(rest.available).toBeGreaterThanOrEqual(rest.capacity - (100_000 * 25) / 30 - 1);
+    expect(rest.available).toBeLessThanOrEqual(rest.capacity - (100_000 * 25) / 30 + 1);
+  });
+
+  it('reserves a booking over its own flight, whatever window is queried', () => {
+    const sim = InventorySimulation.create(scarceSeed({ events: [] }), now);
+    const capacity = query(sim, 'banner_guaranteed').capacity;
+    bookRos(sim, capacity / 2);
+    const last = { flight_start_ms: at('2027-01-21T00:00:00Z') };
+    const window = query(sim, 'banner_guaranteed', last);
+    expect(window.booked).toBe(Math.round(window.capacity / 2));
+
+    const later = at('2027-01-11T00:00:00Z');
+    const mid = query(sim, 'banner_guaranteed', { flight_start_ms: at('2027-01-12T00:00:00Z') }, undefined, later);
+    const left = capacity / 2 - sim.booking('ros').delivered.impressions;
+    // Today (day 10) still serves, so the remaining goal spreads over days 10-29.
+    expect(mid.booked).toBeCloseTo((left * mid.capacity) / 200_000, -1);
+  });
+
+  it('leaves nothing available when guarantees overbook shared cells', () => {
+    const sim = InventorySimulation.create(scarceSeed(), now);
+    const capacity = query(sim, 'banner_guaranteed').capacity;
+    bookSegment(sim, capacity * 0.6);
+    bookRos(sim, capacity * 0.6);
+    for (const result of [query(sim, 'banner_guaranteed'), query(sim, 'banner_auction'), query(sim, 'banner_guaranteed', {}, segment)]) {
+      expect(result.available).toBe(0);
+    }
+  });
+
+  it('reserves only what the budget buys', () => {
+    const sim = InventorySimulation.create(scarceSeed(), now);
+    const capacity = query(sim, 'banner_guaranteed').capacity;
+    // $1,500 at $10 CPM buys 150,000 of a 300,000 goal.
+    bookRos(sim, capacity, {}, 1500);
+    const result = query(sim, 'banner_guaranteed');
+    expect(result.booked).toBe(150_000);
+    expect(result.available).toBe(capacity - 150_000);
+  });
+
+  it('builds reservations without touching shared traffic, and refreshes them on book and update', () => {
+    const sim = InventorySimulation.create(scarceSeed(), now);
+    const empty = query(sim, 'banner_guaranteed');
+    bookRos(sim, 100_000);
+    const first = query(sim, 'banner_guaranteed');
+    expect(query(sim, 'banner_guaranteed')).toEqual(first);
+    expect(first.booked).toBe(100_000);
+    expect(query(InventorySimulation.create(scarceSeed(), now), 'banner_guaranteed')).toEqual(empty);
+    sim.update('ros', { impression_goal: 200_000 }, now);
+    expect(query(sim, 'banner_guaranteed').booked).toBe(200_000);
+    bookSegment(sim, 50_000);
+    expect(query(sim, 'banner_guaranteed').booked).toBeGreaterThan(200_000);
+  });
+});
+
 describe('installments', () => {
   const now = at('2026-12-31T12:00:00Z');
 
