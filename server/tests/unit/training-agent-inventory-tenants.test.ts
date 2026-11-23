@@ -646,6 +646,65 @@ describe('inventory tenants', () => {
       }
       expect((await control(token, { operation: 'get' })).simulated.pinned).toBe(false);
     });
+
+    const bookGuaranteed = (token: string, key: string, start_time: string, end_time: string) =>
+      call(tenant, 'create_media_buy', {
+        idempotency_key: `inventory-clock-start-${key}-${token}`, account: ACCOUNT, brand: BRAND, start_time, end_time,
+        packages: [{ product_id: 'sports_hero_guaranteed', pricing_option_id: 'sports_hero_guaranteed_cpm', budget: 3000, impressions: 180_000 }],
+      }, token);
+
+    it('runs a season from a started clock in the past', async () => {
+      const token = freshToken();
+      expect((await control(token, {}, 'reset_state')).success).toBe(true);
+      const started = await startAt(token, '2026-11-05T00:00:00Z');
+      expect(started.success, JSON.stringify(started)).toBe(true);
+      await provision(token);
+      const products = await call(tenant, 'get_products', {
+        buying_mode: 'wholesale', account: ACCOUNT, brand: BRAND, filters: { start_date: '2026-11-06', end_date: '2026-11-30' },
+      }, token);
+      expectCanonical('get_products', products);
+      expect(products.products.map((product: Structured) => product.product_id)).toContain('sports_hero_guaranteed');
+
+      const booked = await bookGuaranteed(token, 'season', '2026-11-06T00:00:00Z', '2026-11-30T00:00:00Z');
+      expectCanonical('create_media_buy', booked);
+      for (let i = 0; i < 3; i++) {
+        const advanced = await control(token, { operation: 'advance_time', by: 'P1D' });
+        expect(advanced.success, JSON.stringify(advanced)).toBe(true);
+      }
+      expect((await control(token, { operation: 'get' })).simulated.simulated_now).toBe('2026-11-08T00:00:00.000Z');
+
+      const delivery = await call(tenant, 'get_media_buy_delivery', { account: ACCOUNT, media_buy_ids: [booked.media_buy_id] }, token);
+      expectCanonical('get_media_buy_delivery', delivery);
+      expect(delivery.media_buy_deliveries[0].totals.impressions).toBeGreaterThan(0);
+
+      const second = await startAt(token, '2026-11-05T00:00:00Z');
+      expect(second.error).toBe('INVALID_TRANSITION');
+      expect(second.error_detail).toContain('the clock is already pinned at 2026-11-08T00:00:00.000Z');
+
+      expect((await control(token, {}, 'reset_state')).success).toBe(true);
+      const third = await startAt(token, '2026-11-05T00:00:00Z');
+      expect(third.success, JSON.stringify(third)).toBe(true);
+      expect(third.simulated.simulated_now).toBe('2026-11-05T00:00:00.000Z');
+    });
+
+    it('runs empty days when started before the season', async () => {
+      const token = freshToken();
+      const started = await startAt(token, '2026-10-25T00:00:00Z');
+      expect(started.success, JSON.stringify(started)).toBe(true);
+      await provision(token);
+      const booked = await bookGuaranteed(token, 'preseason', '2026-10-26T00:00:00Z', '2026-11-10T00:00:00Z');
+      expectCanonical('create_media_buy', booked);
+      const advanced = await control(token, { operation: 'advance_time', to: '2026-11-03T00:00:00Z' });
+      expect(advanced.success, JSON.stringify(advanced)).toBe(true);
+
+      const delivery = await call(tenant, 'get_media_buy_delivery', { account: ACCOUNT, media_buy_ids: [booked.media_buy_id] }, token);
+      expectCanonical('get_media_buy_delivery', delivery);
+      const daily = delivery.media_buy_deliveries[0].daily_breakdown as Structured[];
+      const delivered = daily.filter(row => row.impressions > 0).map(row => row.date as string);
+      expect(delivered.length).toBeGreaterThan(0);
+      expect(delivered.filter(date => date < '2026-11-01')).toEqual([]);
+      expect(delivered.some(date => date >= '2026-11-01')).toBe(true);
+    });
   });
 
   describe('creatives on /inventory-adserver', () => {
