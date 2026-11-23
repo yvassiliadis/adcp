@@ -45,10 +45,10 @@ function failure(error: string, detail: string): Json {
   return { success: false, error, error_detail: detail };
 }
 
-/** Why the caller's sandbox is not unused, or undefined once it is clear to
- * start. A clear sandbox has had its untouched grants and empty markets
- * removed, so they are rebuilt at the started clock. */
-export type UnusedSandboxCheck = (sandbox: LoadedSandbox) => Promise<string | undefined>;
+/** Claims the caller's sandbox for a start: returns why it is not unused, or
+ * undefined after removing its untouched grants and empty markets, which are
+ * rebuilt at the started clock. */
+export type UnusedSandboxClaim = (sandbox: LoadedSandbox) => Promise<string | undefined>;
 
 async function startClock(
   params: Json,
@@ -56,13 +56,13 @@ async function startClock(
   market: { tenantId: string; seed: SeasonSeed },
   sandbox: LoadedSandbox,
   nowMs: number,
-  unusedSandboxReason: UnusedSandboxCheck,
+  claimUnusedSandbox: UnusedSandboxClaim,
 ): Promise<Json> {
   if (params.by !== undefined) return failure('INVALID_PARAMS', 'start takes params.to (an RFC 3339 date-time), not params.by');
   const target = typeof params.to === 'string' ? Date.parse(params.to) : Number.NaN;
   if (!Number.isFinite(target)) return failure('INVALID_PARAMS', 'start requires params.to, an RFC 3339 date-time');
   if (Math.abs(target - nowMs) > MAX_ADVANCE_MS) return failure('INVALID_PARAMS', 'start sets the clock at most ten years from now');
-  const reason = await unusedSandboxReason(sandbox);
+  const reason = await claimUnusedSandbox(sandbox);
   if (reason) {
     return failure('INVALID_TRANSITION', `start sets the clock of an unused sandbox only: ${reason}. Call reset_state on an inventory tenant, then start.`);
   }
@@ -83,7 +83,7 @@ export async function handleSandboxClock(
   params: Json,
   ctx: TrainingContext,
   market: { tenantId: string; seed: SeasonSeed },
-  unusedSandboxReason: UnusedSandboxCheck,
+  claimUnusedSandbox: UnusedSandboxClaim,
 ): Promise<Json> {
   const operation = params.operation;
   const sandbox = await loadSandbox(ctx.principal);
@@ -95,7 +95,7 @@ export async function handleSandboxClock(
       message: `simulated_now is ${sandboxNowIso(sandbox.doc)}`,
     };
   }
-  if (operation === 'start') return startClock(params, ctx, market, sandbox, nowMs, unusedSandboxReason);
+  if (operation === 'start') return startClock(params, ctx, market, sandbox, nowMs, claimUnusedSandbox);
   if (operation !== 'advance_time') {
     return failure('INVALID_PARAMS', 'sandbox_clock requires params.operation: get, start or advance_time');
   }

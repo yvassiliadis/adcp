@@ -510,7 +510,7 @@ describe('inventory tenants', () => {
         simulated: { simulated_now: '2026-11-05T00:00:00.000Z', pinned: true },
         message: 'Sandbox clock started at 2026-11-05T00:00:00.000Z',
       });
-      expect(started.simulated.previous_simulated_now.slice(0, 13)).toBe('2026-11-20T09');
+      expect(Math.abs(Date.parse(started.simulated.previous_simulated_now) - Date.parse(WALL_CLOCK))).toBeLessThan(60_000);
       const read = await control(token, { operation: 'get' });
       expect(read.simulated).toEqual({ simulated_now: '2026-11-05T00:00:00.000Z', pinned: true });
     });
@@ -548,7 +548,7 @@ describe('inventory tenants', () => {
       }, token);
       expect(synced.adcp_error, JSON.stringify(synced).slice(0, 400)).toBeUndefined();
       const before = (await listAccounts(token)).accounts[0].authorization.authorized_at;
-      expect(before.slice(0, 13)).toBe('2026-11-20T09');
+      expect(Math.abs(Date.parse(before) - Date.parse(WALL_CLOCK))).toBeLessThan(60_000);
 
       const started = await startAt(token, '2026-11-05T00:00:00Z');
       expect(started.success, JSON.stringify(started)).toBe(true);
@@ -582,6 +582,39 @@ describe('inventory tenants', () => {
         packages: [{ product_id: 'morning_brief_midroll', pricing_option_id: 'morning_brief_midroll_cpm', budget: 5000 }],
       }, token);
       expect(booked.adcp_error, JSON.stringify(booked).slice(0, 400)).toBeUndefined();
+      const refused = await startAt(token, '2026-11-05T00:00:00Z', 'inventory-adserver');
+      expect(refused.error).toBe('INVALID_TRANSITION');
+      expect(refused.error_detail).toContain('inventory-content holds your media buys, creatives or seeded products');
+    });
+
+    it('refuses start after an account timezone change', async () => {
+      const token = freshToken();
+      const synced = await call(tenant, 'sync_accounts', {
+        adcp_version: PREVIEW, idempotency_key: `inventory-clock-start-tz-${token}`, accounts: [{ ...ACCOUNT, billing: 'operator' }],
+      }, token);
+      expect(synced.adcp_error, JSON.stringify(synced).slice(0, 400)).toBeUndefined();
+      const account = (await listAccounts(token)).accounts[0];
+      const changed = await call('sales', 'comply_test_controller', {
+        adcp_version: PREVIEW, scenario: 'reporting_subscription_probe', account: ACCOUNT,
+        params: { operation: 'set_account_timezone', account_id: account.account_id, timezone: 'America/Los_Angeles' },
+      }, token);
+      expect(changed.success, JSON.stringify(changed).slice(0, 400)).toBe(true);
+      const refused = await startAt(token, '2026-11-05T00:00:00Z');
+      expect(refused.error).toBe('INVALID_TRANSITION');
+      expect(refused.error_detail).toContain('account timezone changes are recorded');
+    });
+
+    it('refuses start while a tenant holds only seeded products', async () => {
+      const token = freshToken();
+      await provision(token);
+      const seeded = await control(token, {
+        product_id: 'seeded_rectangle',
+        fixture: {
+          delivery_type: 'non_guaranteed', channels: ['display'], name: 'Seeded rectangle',
+          format_options: [{ format_option_id: 'display_300x250', format_kind: 'image', params: { width: 300, height: 250 } }],
+        },
+      }, 'seed_product', 'inventory-content');
+      expect(seeded.success, JSON.stringify(seeded).slice(0, 400)).toBe(true);
       const refused = await startAt(token, '2026-11-05T00:00:00Z', 'inventory-adserver');
       expect(refused.error).toBe('INVALID_TRANSITION');
       expect(refused.error_detail).toContain('inventory-content holds your media buys, creatives or seeded products');

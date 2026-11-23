@@ -66,16 +66,17 @@ function grantUntouched(grant: GrantRecord): boolean {
 }
 
 /**
- * Why the caller's sandbox cannot start a clock, or undefined when it can.
+ * Claim the caller's sandbox for a clock start. Returns why it cannot be
+ * claimed, or undefined when it can.
  * Grants, timezone changes and markets are stamped from the clock, and a clock
  * moved behind a stamp leaves it in the future. A sandbox is unused while the
  * clock is unpinned, no timezone changed, every grant is untouched and no
  * inventory tenant holds the caller's buys, creatives or seeded products.
- * When it is, the untouched grants (recreated at the started clock on the next
+ * Claiming it also clears state: the untouched grants (recreated at the started clock on the next
  * account read) and empty stored markets are removed from the document and the
  * store; the caller saves the document.
  */
-async function unusedSandboxReason(sandbox: LoadedSandbox, principal: string | undefined): Promise<string | undefined> {
+async function claimUnusedSandbox(sandbox: LoadedSandbox, principal: string | undefined): Promise<string | undefined> {
   const { doc } = sandbox;
   if (doc.simulated_now !== undefined) return `the clock is already pinned at ${doc.simulated_now}`;
   if (doc.timezone_changes.some(entry => entry.changes.length > 0)) return 'account timezone changes are recorded';
@@ -96,7 +97,7 @@ export function handleInventorySandboxClock(tenantId: string, params: Record<str
     params,
     { mode: 'open', principal: principal ?? 'anonymous' },
     INVENTORY_TENANT_PROFILES[tenantId],
-    sandbox => unusedSandboxReason(sandbox, principal),
+    sandbox => claimUnusedSandbox(sandbox, principal),
   ));
 }
 
