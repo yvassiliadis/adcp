@@ -266,6 +266,7 @@ export class InventorySimulation {
   update(bookingId: string, patch: BookingPatch, nowMs: number): Booking {
     this.advanceTo(nowMs);
     const booking = this.booking(bookingId);
+    this.revision += 1;
     if (booking.status === 'canceled') throw new EngineError('INVALID_BOOKING', `Booking ${bookingId} is canceled`);
     if (patch.budget !== undefined) booking.budget = positive(patch.budget, 'budget');
     if (patch.impression_goal !== undefined) {
@@ -447,7 +448,7 @@ export class InventorySimulation {
     for (const { booking, cells, first, last } of goals) {
       const left = Math.min(Math.max(0, (booking.impression_goal ?? 0) - booking.delivered.impressions), this.affordableImpressions(booking));
       const total = supplyOver(cells, first, last);
-      if (total === 0 || left <= 0) continue;
+      if (!(total > 0) || !(left > 0)) continue;
       const share = Math.min(1, left / total);
       for (let day = first; day < last; day++) {
         for (const cell of cells) reserve(day, cell, share * residual(day, cell));

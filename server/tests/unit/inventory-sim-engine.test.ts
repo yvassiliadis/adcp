@@ -380,7 +380,8 @@ describe('forecast reservations', () => {
     const mid = query(sim, 'banner_guaranteed', { flight_start_ms: at('2027-01-12T00:00:00Z') }, undefined, later);
     const left = capacity / 2 - sim.booking('ros').delivered.impressions;
     // Today (day 10) still serves, so the remaining goal spreads over days 10-29.
-    expect(mid.booked).toBeCloseTo((left * mid.capacity) / 200_000, -1);
+    const today = query(sim, 'banner_guaranteed', { flight_start_ms: at('2027-01-11T00:00:00Z'), flight_end_ms: at('2027-01-12T00:00:00Z') }).capacity;
+    expect(mid.booked).toBeCloseTo((left * mid.capacity) / (today + mid.capacity), -1);
   });
 
   it('leaves nothing available when guarantees overbook shared cells', () => {
@@ -404,17 +405,29 @@ describe('forecast reservations', () => {
   });
 
   it('builds reservations without touching shared traffic, and refreshes them on book and update', () => {
-    const sim = InventorySimulation.create(scarceSeed(), now);
+    const seed = scarceSeed();
+    const sim = InventorySimulation.create(seed, now);
     const empty = query(sim, 'banner_guaranteed');
     bookRos(sim, 100_000);
     const first = query(sim, 'banner_guaranteed');
     expect(query(sim, 'banner_guaranteed')).toEqual(first);
     expect(first.booked).toBe(100_000);
-    expect(query(InventorySimulation.create(scarceSeed(), now), 'banner_guaranteed')).toEqual(empty);
+    expect(query(InventorySimulation.create(seed, now), 'banner_guaranteed')).toEqual(empty);
     sim.update('ros', { impression_goal: 200_000 }, now);
     expect(query(sim, 'banner_guaranteed').booked).toBe(200_000);
     bookSegment(sim, 50_000);
     expect(query(sim, 'banner_guaranteed').booked).toBeGreaterThan(200_000);
+  });
+
+  it('drops a reservation when its booking is canceled or its budget is cut', () => {
+    const sim = InventorySimulation.create(scarceSeed(), now);
+    bookRos(sim, 200_000);
+    expect(query(sim, 'banner_guaranteed').booked).toBe(200_000);
+    // $1,000 at $10 CPM buys 100,000.
+    sim.update('ros', { budget: 1000 }, now);
+    expect(query(sim, 'banner_guaranteed').booked).toBe(100_000);
+    sim.update('ros', { status: 'canceled' }, now);
+    expect(query(sim, 'banner_guaranteed').booked).toBe(0);
   });
 });
 
