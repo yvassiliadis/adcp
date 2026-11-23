@@ -67,20 +67,22 @@ Every time-dependent behaviour of these tenants reads your *sandbox clock*. Unti
 ```
 
 - `get` returns `simulated.simulated_now`, and `pinned: false` while the clock still reads the wall clock.
-- `start` pins the clock at `to`, an RFC 3339 instant in the past or the future, within ten years of the wall clock. It returns `simulated_now`, `previous_simulated_now` and `pinned: true`. It takes `to` only: `by` is refused with `INVALID_PARAMS`, as is a missing, malformed or out-of-range `to`. A start in the future runs the days up to it, as `advance_time` does.
+- `start` pins the clock at `to`, an RFC 3339 instant in the past or the future, within ten years of the wall clock. It returns `simulated_now`, `previous_simulated_now` and `pinned: true`. It takes `to` only: `by` is refused with `INVALID_PARAMS`, as is a missing, malformed or out-of-range `to`. A start in the future also runs the account-request work that falls due by that instant, as `advance_time` does. It runs no market days, because a start leaves no market to run.
 - `advance_time` takes either `to` (an RFC 3339 instant) or `by` (an ISO 8601 duration in weeks, days, hours, minutes or seconds). It returns the new `simulated_now` and `days_crossed`, the number of UTC days the clock moved across. The tenant you call runs those days at once; the other runs them on your next call to it, with the same results.
-- After a `start`, the clock only moves forward. An earlier instant is refused with `INVALID_TRANSITION`. To start again, call `reset_state` first.
+- `advance_time` only moves the clock forward: an earlier instant is refused with `INVALID_TRANSITION`. Once the clock is pinned, `start` is refused too. To start again, call `reset_state` first.
 - `reset_state` on either inventory tenant unpins the clock and discards your buys on both. A `reset_state` elsewhere that unpins the clock, such as `/sales/mcp`'s, also leaves your inventory buys behind: a market that has run days the clock has not reached starts fresh.
 - You have one clock per credential. It is the same clock that `reporting_subscription_probe` `advance_time` moves on `/sales/mcp`, so moving it on either tenant moves it for both.
 
 ### Start on an unused sandbox
 
-`start` is the only operation that sets the clock back, so it is accepted only while your sandbox is unused. Everything the tenants stamp from the clock would otherwise sit in the future of the new time. All of these must hold:
+`start` is the only operation that sets the clock to an earlier instant you choose, so it is accepted only while your sandbox is unused. Everything the tenants stamp from the clock would otherwise sit in the future of the new time. All of these must hold:
 
 - The clock is unpinned.
 - You have recorded no account timezone changes.
-- Every grant on your accounts is untouched: never revoked, reduced or granted again. Untouched grants are removed by `start` and recreated at the started clock the next time you read your accounts.
-- Neither tenant holds media buys, creatives or seeded products for you. An empty market is discarded.
+- Every grant on your accounts is untouched: never revoked, reduced or granted again.
+- Neither tenant holds media buys, creatives or seeded products for you.
+
+`start` removes your untouched grants, which are recreated at the started clock the next time you read your accounts. It also discards an empty market.
 
 Otherwise `start` returns `INVALID_TRANSITION` with the first reason, such as `the clock is already pinned at 2026-12-31T12:00:00.000Z` or `inventory-adserver holds your media buys, creatives or seeded products`. Call `reset_state` on either inventory tenant, then `start` again.
 
