@@ -29,10 +29,27 @@ type Json = Record<string, unknown>;
 
 /** A full date, `T`, a time with optional fractional seconds, and a `Z` or
  * ±hh:mm offset. */
-const RFC_3339_RE = /^\d{4}-\d{2}-\d{2}[Tt]\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:[Zz]|[+-]\d{2}:\d{2})$/;
+const RFC_3339_RE = /^(\d{4})-(\d{2})-(\d{2})[Tt](\d{2}):(\d{2}):(\d{2})(?:\.\d+)?(?:[Zz]|[+-](\d{2}):(\d{2}))$/;
 const DURATION_RE = /^P(?:(\d+)W)?(?:(\d+)D)?(?:T(?:(\d+)H)?(?:(\d+)M)?(?:(\d+)S)?)?$/;
 /** Ten years: far past any season, short of overflowing a Date. */
 const MAX_ADVANCE_MS = 10 * 366 * 24 * 60 * 60 * 1000;
+
+/** The epoch milliseconds of an RFC 3339 date-time, or undefined when the
+ * value is not one or a field is out of range. Fields are range-checked
+ * because Date.parse rolls impossible values over (February 30 becomes
+ * March 2) and would pin a different instant than the caller sent. A leap
+ * second is refused: a Date cannot represent it. */
+export function parseRfc3339Instant(value: unknown): number | undefined {
+  if (typeof value !== 'string') return undefined;
+  const match = RFC_3339_RE.exec(value);
+  if (!match) return undefined;
+  const [year, month, day, hour, minute, second, offsetHour = 0, offsetMinute = 0] = match.slice(1).map(part => (part === undefined ? 0 : Number(part)));
+  if (month < 1 || month > 12) return undefined;
+  if (day < 1 || day > new Date(Date.UTC(year, month, 0)).getUTCDate()) return undefined;
+  if (hour > 23 || minute > 59 || second > 59 || offsetHour > 23 || offsetMinute > 59) return undefined;
+  const instant = Date.parse(value);
+  return Number.isFinite(instant) ? instant : undefined;
+}
 
 /** An ISO 8601 duration in weeks, days, hours, minutes and seconds, in
  * milliseconds. Months and years are refused: their length depends on the
@@ -61,8 +78,8 @@ async function startClock(
   claimUnusedSandbox: UnusedSandboxClaim,
 ): Promise<Json> {
   if (params.by !== undefined) return failure('INVALID_PARAMS', 'start takes params.to (an RFC 3339 date-time), not params.by');
-  const target = typeof params.to === 'string' && RFC_3339_RE.test(params.to) ? Date.parse(params.to) : Number.NaN;
-  if (!Number.isFinite(target)) return failure('INVALID_PARAMS', 'start requires params.to, an RFC 3339 date-time');
+  const target = parseRfc3339Instant(params.to);
+  if (target === undefined) return failure('INVALID_PARAMS', 'start requires params.to, an RFC 3339 date-time');
   if (Math.abs(target - sandboxWallClockMs()) > MAX_ADVANCE_MS) return failure('INVALID_PARAMS', 'start sets the clock at most ten years from now');
   const reason = await claimUnusedSandbox(sandbox);
   if (reason) {

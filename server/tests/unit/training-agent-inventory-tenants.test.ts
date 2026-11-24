@@ -651,12 +651,26 @@ describe('inventory tenants', () => {
         { operation: 'start', to: 20261105 },
         { operation: 'start', to: '2040-01-01T00:00:00Z' },
         { operation: 'start', to: '2010-01-01T00:00:00Z' },
+        { operation: 'start', to: '2026-02-30T00:00:00Z' },
+        { operation: 'start', to: '2026-02-29T00:00:00Z' },
+        { operation: 'start', to: '2026-04-31T00:00:00Z' },
+        { operation: 'start', to: '2026-01-01T24:00:00Z' },
+        { operation: 'start', to: '2026-01-01T00:00:60Z' },
       ]) {
         const refused = await control(token, params);
         expect(refused.success, JSON.stringify(params)).toBe(false);
         expect(refused.error, JSON.stringify(params)).toBe('INVALID_PARAMS');
       }
       expect((await control(token, { operation: 'get' })).simulated.pinned).toBe(false);
+    });
+
+    it('accepts a valid leap day and pins an offset start at the right UTC instant', async () => {
+      const leap = await startAt(freshToken(), '2028-02-29T00:00:00Z');
+      expect(leap.success, JSON.stringify(leap)).toBe(true);
+      expect(leap.simulated.simulated_now).toBe('2028-02-29T00:00:00.000Z');
+      const offset = await startAt(freshToken(), '2026-11-05T05:30:00+05:30');
+      expect(offset.success, JSON.stringify(offset)).toBe(true);
+      expect(offset.simulated.simulated_now).toBe('2026-11-05T00:00:00.000Z');
     });
 
     const bookGuaranteed = (token: string, key: string, start_time: string, end_time: string) =>
