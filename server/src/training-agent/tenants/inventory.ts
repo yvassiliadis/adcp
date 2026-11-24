@@ -11,8 +11,8 @@
  *   package's flight. Installments run, are postponed or are cancelled on
  *   their dates, and each builds its audience over its channel's curve.
  *
- * Their `comply_test_controller` serves `sandbox_clock` (get and advance the
- * caller's sandbox clock; the router intercepts it, as the SDK's controller
+ * Their `comply_test_controller` serves `sandbox_clock` (get, start and advance
+ * the caller's sandbox clock; the router intercepts it, as the SDK's controller
  * config has no slot for it) and `reset_state` (unpin the clock and discard
  * the caller's markets on every inventory tenant).
  *
@@ -23,8 +23,9 @@
 import type { TenantConfig } from '@adcp/sdk/server';
 import { ADSERVER_SEASON, CONTENT_SEASON } from '../inventory-sim/engine/index.js';
 import { InventoryPlatform, type InventoryTenantProfile } from '../inventory-sim/platform.js';
-import { resetMarket, withCallerMarkets } from '../inventory-sim/market-store.js';
+import { callerMarketContents, resetMarket, withCallerMarkets } from '../inventory-sim/market-store.js';
 import { SANDBOX_CLOCK_SCENARIO, handleSandboxClock } from '../inventory-sim/sandbox-clock.js';
+import type { GrantRecord, LoadedSandbox } from '../account-sandbox.js';
 import { resetReportingSubscriptionProbe } from '../subscription-probe.js';
 import { getTenantSigningMaterial } from './signing.js';
 import { listAccountsTool } from './account-tools.js';
@@ -54,6 +55,43 @@ export function isInventoryTenant(tenantId: string): boolean {
 /** Controller scenarios an inventory tenant lists. */
 export const INVENTORY_COMPLY_SCENARIOS: readonly string[] = ['reset_state', SANDBOX_CLOCK_SCENARIO, 'seed_account', 'seed_product', 'seed_pricing_option'];
 
+function grantUntouched(grant: GrantRecord): boolean {
+  return grant.unauthorized_at === undefined
+    && grant.regranted_at === undefined
+    && grant.allowed_tasks === undefined
+    && grant.reporting_unauthorized_at === undefined
+    && grant.read_only !== true
+    && grant.history.length === 1
+    && grant.history[0].unauthorized_at === undefined;
+}
+
+/**
+ * Claim the caller's sandbox for a clock start. Returns why it cannot be
+ * claimed, or undefined when it can.
+ *
+ * Grants, timezone changes and markets are stamped from the clock, and a clock
+ * moved behind a stamp leaves it in the future. A sandbox is unused while the
+ * clock is unpinned, no timezone changed, every grant is untouched and no
+ * inventory tenant holds the caller's buys, creatives or seeded products.
+ *
+ * Claiming it also clears state: the untouched grants (recreated at the
+ * started clock on the next account read) and empty stored markets are removed
+ * from the document and the store. The caller saves the document.
+ */
+async function claimUnusedSandbox(sandbox: LoadedSandbox, principal: string | undefined): Promise<string | undefined> {
+  const { doc } = sandbox;
+  if (doc.simulated_now !== undefined) return `the clock is already pinned at ${doc.simulated_now}`;
+  if (doc.timezone_changes.some(entry => entry.changes.length > 0)) return 'account timezone changes are recorded';
+  const changed = doc.grants.find(grant => !grantUntouched(grant));
+  if (changed) return `your grant on ${changed.account_id} has changed since ${changed.authorized_at}`;
+  const markets = await callerMarketContents(principal, INVENTORY_TENANT_IDS);
+  const holding = markets.find(market => market.hasContent);
+  if (holding) return `${holding.tenantId} holds your media buys, creatives or seeded products`;
+  doc.grants = [];
+  for (const { tenantId } of markets) await resetMarket(tenantId, principal);
+  return undefined;
+}
+
 /** `sandbox_clock` for a caller, called on one inventory tenant. Moving the
  * clock runs the market's days, so it is one of the caller's market requests. */
 export function handleInventorySandboxClock(tenantId: string, params: Record<string, unknown>, principal: string | undefined) {
@@ -61,6 +99,7 @@ export function handleInventorySandboxClock(tenantId: string, params: Record<str
     params,
     { mode: 'open', principal: principal ?? 'anonymous' },
     INVENTORY_TENANT_PROFILES[tenantId],
+    sandbox => claimUnusedSandbox(sandbox, principal),
   ));
 }
 

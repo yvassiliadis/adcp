@@ -146,6 +146,24 @@ export async function advanceMarket(tenantId: string, seed: SeasonSeed, principa
   return ran.length;
 }
 
+/** Whether the caller's stored market on each tenant holds media buys,
+ * creatives or seeded products. A tenant with no stored market has none. */
+export async function callerMarketContents(
+  principal: string | undefined,
+  tenantIds: readonly string[],
+): Promise<Array<{ tenantId: string; hasContent: boolean }>> {
+  const sandbox = await loadSandbox(principal);
+  return tenantIds.map(tenantId => {
+    const stored = sandbox.session.principalConfigurations.get(marketKey(tenantId, principal)) as MarketDocument | undefined;
+    const hasContent = stored !== undefined
+      && (stored.media_buys.length > 0
+        || (stored.creatives?.length ?? 0) > 0
+        || (stored.seeded?.products?.length ?? 0) > 0
+        || (stored.seeded?.pricing_options?.length ?? 0) > 0);
+    return { tenantId, hasContent };
+  });
+}
+
 /** Discard the caller's market on a tenant. */
 export async function resetMarket(tenantId: string, principal: string | undefined): Promise<void> {
   const sandbox = await loadSandbox(principal);

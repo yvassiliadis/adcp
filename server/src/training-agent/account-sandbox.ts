@@ -7,7 +7,9 @@
  *   storyboard moves it with `reporting_subscription_probe` `advance_time`, it
  *   reads the wall clock. Once moved it stays at the target instant, so every
  *   later timestamp the caller's sandbox issues is deterministic. It only moves
- *   forward. `reset_state` discards it with the rest of the caller's sandbox.
+ *   forward, except that an inventory `sandbox_clock` `start` on an unused
+ *   sandbox may set it to any instant. `reset_state` discards it with the rest
+ *   of the caller's sandbox.
  * - **Grants.** The caller's authorization on each account it holds: the
  *   chain start (`authorized_at`), the latest re-grant in the chain
  *   (`regranted_at`), a revocation (`unauthorized_at`), and an optional reduced
@@ -139,6 +141,11 @@ let wallClock: () => number = () => Date.now();
  * restore `Date.now`. */
 export function setSandboxWallClockForTesting(clock?: () => number): void {
   wallClock = clock ?? (() => Date.now());
+}
+
+/** The wall clock an unpinned sandbox clock reads. */
+export function sandboxWallClockMs(): number {
+  return wallClock();
 }
 
 export function sandboxNowMs(doc: SandboxDocument): number {

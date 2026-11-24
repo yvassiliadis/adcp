@@ -492,6 +492,247 @@ describe('inventory tenants', () => {
     });
   });
 
+  describe('sandbox_clock start on the inventory tenants', () => {
+    const tenant = 'inventory-adserver';
+    const PREVIEW = '3.3-rc.3';
+    let tokenCounter = 0;
+    const freshToken = () => `demo-inventory-clock-start-t${++tokenCounter}-v1`;
+    const control = (token: string, params: Record<string, unknown>, scenario = 'sandbox_clock', on = tenant) =>
+      call(on, 'comply_test_controller', { scenario, account: ACCOUNT, params }, token);
+    const startAt = (token: string, to: string, on = tenant) => control(token, { operation: 'start', to }, 'sandbox_clock', on);
+    const listAccounts = (token: string) => call(tenant, 'list_accounts', { adcp_version: PREVIEW }, token);
+
+    it('starts an unused sandbox at a past instant', async () => {
+      const token = freshToken();
+      const started = await startAt(token, '2026-11-05T00:00:00Z');
+      expect(started).toMatchObject({
+        success: true,
+        simulated: { simulated_now: '2026-11-05T00:00:00.000Z', pinned: true },
+        message: 'Sandbox clock started at 2026-11-05T00:00:00.000Z',
+      });
+      expect(Math.abs(Date.parse(started.simulated.previous_simulated_now) - Date.parse(WALL_CLOCK))).toBeLessThan(10 * 60_000);
+      const read = await control(token, { operation: 'get' });
+      expect(read.simulated).toEqual({ simulated_now: '2026-11-05T00:00:00.000Z', pinned: true });
+    });
+
+    it('starts an unused sandbox at a future instant', async () => {
+      const token = freshToken();
+      const started = await startAt(token, '2026-12-06T00:00:00Z');
+      expect(started.success, JSON.stringify(started)).toBe(true);
+      expect(started.simulated).toMatchObject({ simulated_now: '2026-12-06T00:00:00.000Z', pinned: true });
+      expect((await control(token, { operation: 'get' })).simulated.simulated_now).toBe('2026-12-06T00:00:00.000Z');
+    });
+
+    it('refuses a second start', async () => {
+      const token = freshToken();
+      await startAt(token, '2026-11-05T00:00:00Z');
+      const second = await startAt(token, '2026-11-06T00:00:00Z');
+      expect(second.success).toBe(false);
+      expect(second.error).toBe('INVALID_TRANSITION');
+      expect(second.error_detail).toContain('2026-11-05T00:00:00.000Z');
+      expect(second.error_detail).toContain('reset_state on an inventory tenant');
+    });
+
+    it('refuses start after advance_time', async () => {
+      const token = freshToken();
+      await control(token, { operation: 'advance_time', to: '2026-11-21T09:00:00Z' });
+      const refused = await startAt(token, '2026-11-05T00:00:00Z');
+      expect(refused.error).toBe('INVALID_TRANSITION');
+      expect(refused.error_detail).toContain('the clock is already pinned at 2026-11-21T09:00:00.000Z');
+    });
+
+    it('refuses start as already pinned when the clock is pinned beyond ten years from the wall clock', async () => {
+      const token = freshToken();
+      for (let i = 0; i < 2; i++) {
+        expect((await control(token, { operation: 'advance_time', by: 'P3000D' })).success).toBe(true);
+      }
+      const refused = await startAt(token, '2026-11-05T00:00:00Z');
+      expect(refused.error).toBe('INVALID_TRANSITION');
+      expect(refused.error_detail).toContain('the clock is already pinned at');
+    });
+
+    it('starts after an untouched 3.3 sync_accounts and re-stamps the grant', async () => {
+      const token = freshToken();
+      const synced = await call(tenant, 'sync_accounts', {
+        adcp_version: PREVIEW, idempotency_key: `inventory-clock-start-sync-${token}`, accounts: [{ ...ACCOUNT, billing: 'operator' }],
+      }, token);
+      expect(synced.adcp_error, JSON.stringify(synced).slice(0, 400)).toBeUndefined();
+      const before = (await listAccounts(token)).accounts[0].authorization.authorized_at;
+      expect(Math.abs(Date.parse(before) - Date.parse(WALL_CLOCK))).toBeLessThan(10 * 60_000);
+
+      const started = await startAt(token, '2026-11-05T00:00:00Z');
+      expect(started.success, JSON.stringify(started)).toBe(true);
+      expect((await listAccounts(token)).accounts[0].authorization.authorized_at).toBe('2026-11-05T00:00:00.000Z');
+    });
+
+    it('refuses start after a grant is revoked', async () => {
+      const token = freshToken();
+      const synced = await call(tenant, 'sync_accounts', {
+        adcp_version: PREVIEW, idempotency_key: `inventory-clock-start-revoke-${token}`, accounts: [{ ...ACCOUNT, billing: 'operator' }],
+      }, token);
+      expect(synced.adcp_error, JSON.stringify(synced).slice(0, 400)).toBeUndefined();
+      const account = (await listAccounts(token)).accounts[0];
+      const revoked = await call('sales', 'comply_test_controller', {
+        adcp_version: PREVIEW, scenario: 'reporting_subscription_probe', account: ACCOUNT, params: { operation: 'revoke_grant', account_id: account.account_id },
+      }, token);
+      expect(revoked.success, JSON.stringify(revoked).slice(0, 400)).toBe(true);
+      // The probe pinned nothing: a revocation records itself at the wall clock.
+      expect((await control(token, { operation: 'get' })).simulated.pinned).toBe(false);
+      const refused = await startAt(token, '2026-11-05T00:00:00Z');
+      expect(refused.error).toBe('INVALID_TRANSITION');
+      expect(refused.error_detail).toContain(`your grant on ${account.account_id} has changed since 2026-11-20T09:`);
+    });
+
+    it("refuses start while a tenant holds the caller's buys", async () => {
+      const token = freshToken();
+      await provision(token);
+      const booked = await call('inventory-content', 'create_media_buy', {
+        idempotency_key: `inventory-clock-start-buy-${token}`, account: ACCOUNT, brand: BRAND,
+        start_time: '2027-01-01T00:00:00Z', end_time: '2027-02-01T00:00:00Z',
+        packages: [{ product_id: 'morning_brief_midroll', pricing_option_id: 'morning_brief_midroll_cpm', budget: 5000 }],
+      }, token);
+      expect(booked.adcp_error, JSON.stringify(booked).slice(0, 400)).toBeUndefined();
+      const refused = await startAt(token, '2026-11-05T00:00:00Z', 'inventory-adserver');
+      expect(refused.error).toBe('INVALID_TRANSITION');
+      expect(refused.error_detail).toContain('inventory-content holds your media buys, creatives or seeded products');
+    });
+
+    it('refuses start after an account timezone change', async () => {
+      const token = freshToken();
+      const synced = await call(tenant, 'sync_accounts', {
+        adcp_version: PREVIEW, idempotency_key: `inventory-clock-start-tz-${token}`, accounts: [{ ...ACCOUNT, billing: 'operator' }],
+      }, token);
+      expect(synced.adcp_error, JSON.stringify(synced).slice(0, 400)).toBeUndefined();
+      const account = (await listAccounts(token)).accounts[0];
+      const changed = await call('sales', 'comply_test_controller', {
+        adcp_version: PREVIEW, scenario: 'reporting_subscription_probe', account: ACCOUNT,
+        params: { operation: 'set_account_timezone', account_id: account.account_id, timezone: 'America/Los_Angeles' },
+      }, token);
+      expect(changed.success, JSON.stringify(changed).slice(0, 400)).toBe(true);
+      const refused = await startAt(token, '2026-11-05T00:00:00Z');
+      expect(refused.error).toBe('INVALID_TRANSITION');
+      expect(refused.error_detail).toContain('account timezone changes are recorded');
+    });
+
+    it('refuses start while a tenant holds only seeded products', async () => {
+      const token = freshToken();
+      await provision(token);
+      const seeded = await control(token, {
+        product_id: 'seeded_rectangle',
+        fixture: {
+          delivery_type: 'non_guaranteed', channels: ['display'], name: 'Seeded rectangle',
+          format_options: [{ format_option_id: 'display_300x250', format_kind: 'image', params: { width: 300, height: 250 } }],
+        },
+      }, 'seed_product', 'inventory-content');
+      expect(seeded.success, JSON.stringify(seeded).slice(0, 400)).toBe(true);
+      const refused = await startAt(token, '2026-11-05T00:00:00Z', 'inventory-adserver');
+      expect(refused.error).toBe('INVALID_TRANSITION');
+      expect(refused.error_detail).toContain('inventory-content holds your media buys, creatives or seeded products');
+    });
+
+    it('starts after a plain get_products', async () => {
+      const token = freshToken();
+      await provision(token);
+      const products = await call(tenant, 'get_products', { buying_mode: 'wholesale', account: ACCOUNT, brand: BRAND }, token);
+      expect(products.products.length).toBeGreaterThan(0);
+      const started = await startAt(token, '2026-11-05T00:00:00Z');
+      expect(started.success, JSON.stringify(started)).toBe(true);
+    });
+
+    it('refuses start with by, or a missing, malformed or far-off to', async () => {
+      const token = freshToken();
+      for (const params of [
+        { operation: 'start', by: 'P1D' },
+        { operation: 'start', to: '2026-11-05T00:00:00Z', by: 'P1D' },
+        { operation: 'start' },
+        { operation: 'start', to: 'yesterday' },
+        { operation: 'start', to: '2026-12-06' },
+        { operation: 'start', to: '2026-12-06T00:00:00' },
+        { operation: 'start', to: 20261105 },
+        { operation: 'start', to: '2040-01-01T00:00:00Z' },
+        { operation: 'start', to: '2010-01-01T00:00:00Z' },
+        { operation: 'start', to: '2026-02-30T00:00:00Z' },
+        { operation: 'start', to: '2026-02-29T00:00:00Z' },
+        { operation: 'start', to: '2026-04-31T00:00:00Z' },
+        { operation: 'start', to: '2026-01-01T24:00:00Z' },
+        { operation: 'start', to: '2026-01-01T00:00:60Z' },
+      ]) {
+        const refused = await control(token, params);
+        expect(refused.success, JSON.stringify(params)).toBe(false);
+        expect(refused.error, JSON.stringify(params)).toBe('INVALID_PARAMS');
+      }
+      expect((await control(token, { operation: 'get' })).simulated.pinned).toBe(false);
+    });
+
+    it('accepts a valid leap day and pins an offset start at the right UTC instant', async () => {
+      const leap = await startAt(freshToken(), '2028-02-29T00:00:00Z');
+      expect(leap.success, JSON.stringify(leap)).toBe(true);
+      expect(leap.simulated.simulated_now).toBe('2028-02-29T00:00:00.000Z');
+      const offset = await startAt(freshToken(), '2026-11-05T05:30:00+05:30');
+      expect(offset.success, JSON.stringify(offset)).toBe(true);
+      expect(offset.simulated.simulated_now).toBe('2026-11-05T00:00:00.000Z');
+    });
+
+    const bookGuaranteed = (token: string, key: string, start_time: string, end_time: string) =>
+      call(tenant, 'create_media_buy', {
+        idempotency_key: `inventory-clock-start-${key}-${token}`, account: ACCOUNT, brand: BRAND, start_time, end_time,
+        packages: [{ product_id: 'sports_hero_guaranteed', pricing_option_id: 'sports_hero_guaranteed_cpm', budget: 3000, impressions: 180_000 }],
+      }, token);
+
+    it('runs a season from a started clock in the past', async () => {
+      const token = freshToken();
+      expect((await control(token, {}, 'reset_state')).success).toBe(true);
+      const started = await startAt(token, '2026-11-05T00:00:00Z');
+      expect(started.success, JSON.stringify(started)).toBe(true);
+      await provision(token);
+      const products = await call(tenant, 'get_products', {
+        buying_mode: 'wholesale', account: ACCOUNT, brand: BRAND, filters: { start_date: '2026-11-06', end_date: '2026-11-30' },
+      }, token);
+      expectCanonical('get_products', products);
+      expect(products.products.map((product: Structured) => product.product_id)).toContain('sports_hero_guaranteed');
+
+      const booked = await bookGuaranteed(token, 'season', '2026-11-06T00:00:00Z', '2026-11-30T00:00:00Z');
+      expectCanonical('create_media_buy', booked);
+      for (let i = 0; i < 3; i++) {
+        const advanced = await control(token, { operation: 'advance_time', by: 'P1D' });
+        expect(advanced.success, JSON.stringify(advanced)).toBe(true);
+      }
+      expect((await control(token, { operation: 'get' })).simulated.simulated_now).toBe('2026-11-08T00:00:00.000Z');
+
+      const delivery = await call(tenant, 'get_media_buy_delivery', { account: ACCOUNT, media_buy_ids: [booked.media_buy_id] }, token);
+      expectCanonical('get_media_buy_delivery', delivery);
+      expect(delivery.media_buy_deliveries[0].totals.impressions).toBeGreaterThan(0);
+
+      const second = await startAt(token, '2026-11-05T00:00:00Z');
+      expect(second.error).toBe('INVALID_TRANSITION');
+      expect(second.error_detail).toContain('the clock is already pinned at 2026-11-08T00:00:00.000Z');
+
+      expect((await control(token, {}, 'reset_state')).success).toBe(true);
+      const third = await startAt(token, '2026-11-05T00:00:00Z');
+      expect(third.success, JSON.stringify(third)).toBe(true);
+      expect(third.simulated.simulated_now).toBe('2026-11-05T00:00:00.000Z');
+    });
+
+    it('runs empty days when started before the season', async () => {
+      const token = freshToken();
+      const started = await startAt(token, '2026-10-25T00:00:00Z');
+      expect(started.success, JSON.stringify(started)).toBe(true);
+      await provision(token);
+      const booked = await bookGuaranteed(token, 'preseason', '2026-10-26T00:00:00Z', '2026-11-10T00:00:00Z');
+      expectCanonical('create_media_buy', booked);
+      const advanced = await control(token, { operation: 'advance_time', to: '2026-11-03T00:00:00Z' });
+      expect(advanced.success, JSON.stringify(advanced)).toBe(true);
+
+      const delivery = await call(tenant, 'get_media_buy_delivery', { account: ACCOUNT, media_buy_ids: [booked.media_buy_id] }, token);
+      expectCanonical('get_media_buy_delivery', delivery);
+      const daily = delivery.media_buy_deliveries[0].daily_breakdown as Structured[];
+      const delivered = daily.filter(row => row.impressions > 0).map(row => row.date as string);
+      expect(delivered.length).toBeGreaterThan(0);
+      expect(delivered.filter(date => date < '2026-11-01')).toEqual([]);
+      expect(delivered.some(date => date >= '2026-11-01')).toBe(true);
+    });
+  });
+
   describe('creatives on /inventory-adserver', () => {
     const tenant = 'inventory-adserver';
     const CREATIVE_TOKEN = 'demo-inventory-creatives-v1';
