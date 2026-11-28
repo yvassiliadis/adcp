@@ -11,12 +11,16 @@ export { audienceCurve } from './curves.js';
 export { hash32, uniform, standardNormal } from './rng.js';
 export {
   allocateAuction,
+  allocateFractionalHighWaterMark,
   allocateHighWaterMark,
   supplyOf,
   takeEqualShare,
+  takeFractionalShare,
+  takeFractionalShareOfVoice,
   takeShareOfVoice,
   type BidRequest,
   type CellCounts,
+  type FractionalGoalRequest,
   type GoalRequest,
 } from './allocation.js';
 export {

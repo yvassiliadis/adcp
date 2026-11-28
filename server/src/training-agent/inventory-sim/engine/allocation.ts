@@ -143,3 +143,76 @@ export function allocateAuction(
   }
   return result;
 }
+
+/*
+ * Fractional twins of the allocation functions above, for forecasts: they
+ * follow the same order and the same equal-share rule, but impressions are
+ * real numbers, so a dry run carries no rounding of its own. They never
+ * touch the integer functions `runDay` uses.
+ */
+
+/** Orders supplies that differ by less than a millionth of an impression as equal. */
+function supplyKey(supply: number): number {
+  return Math.round(supply * 1e6) / 1e6;
+}
+
+/** Take `want` impressions as the same share of every cell, or everything when the cells cannot cover it. */
+export function takeFractionalShare(remaining: CellCounts, cells: readonly number[], want: number): CellCounts {
+  const taken: CellCounts = new Map();
+  const supply = supplyOf(remaining, cells);
+  if (!(want > 0) || !(supply > 0)) return taken;
+  const share = Math.min(1, want / supply);
+  for (const cell of cells) {
+    const available = remaining.get(cell) ?? 0;
+    if (available <= 0) continue;
+    const count = share >= 1 ? available : share * available;
+    taken.set(cell, count);
+    remaining.set(cell, available - count);
+  }
+  return taken;
+}
+
+/** Share-of-voice without whole-impression rounding. */
+export function takeFractionalShareOfVoice(
+  remaining: CellCounts,
+  actual: CellCounts,
+  cells: readonly number[],
+  share: number,
+): CellCounts {
+  const taken: CellCounts = new Map();
+  for (const cell of cells) {
+    const available = remaining.get(cell) ?? 0;
+    const count = Math.min(available, share * (actual.get(cell) ?? 0));
+    if (count > 0) {
+      taken.set(cell, count);
+      remaining.set(cell, available - count);
+    }
+  }
+  return taken;
+}
+
+export interface FractionalGoalRequest extends GoalRequest {
+  /** Sorts after requests with an equal supply, whatever the ids. */
+  last?: boolean;
+}
+
+/**
+ * High-water mark allocation on real numbers, in the order of
+ * `allocateHighWaterMark`: smallest supply first, ties by id, with `last`
+ * requests after the others on a tie.
+ */
+export function allocateFractionalHighWaterMark(
+  remaining: CellCounts,
+  requests: readonly FractionalGoalRequest[],
+): Map<string, CellCounts> {
+  const ordered = requests
+    .map(request => ({ request, supply: supplyKey(supplyOf(remaining, request.cells)) }))
+    .sort((a, b) => a.supply - b.supply
+      || Number(a.request.last === true) - Number(b.request.last === true)
+      || compareIds(a.request.id, b.request.id));
+  const result = new Map<string, CellCounts>();
+  for (const { request } of ordered) {
+    result.set(request.id, takeFractionalShare(remaining, request.cells, request.target));
+  }
+  return result;
+}

@@ -1046,7 +1046,11 @@ describe('inventory tenants', () => {
         const first = await book(tenant, TOKEN_GOAL, 'inventory-goal-adserver-a-0001', product, option, share);
         expectCanonical('create_media_buy', first);
         const left = await available(tenant, TOKEN_GOAL, product);
-        expect(left).toBe(open - share);
+        // The first goal paces to expected traffic, so the remainder reads under `open - share`. The bisection stops within
+        // 0.05% of the largest goal that fits, so it reads at most that far under the exact remainder.
+        expect(left).toBeLessThan(open - share);
+        expect(left).toBeLessThanOrEqual(2_768_997);
+        expect(left).toBeGreaterThanOrEqual(2_768_997 - Math.max(1, Math.floor(0.0005 * open)));
 
         const second = await book(tenant, TOKEN_GOAL, 'inventory-goal-adserver-b-0001', product, option, share);
         expect(errorOf(second)).toMatchObject({ code: 'PRODUCT_UNAVAILABLE', field: 'packages[0].impressions', recovery: 'correctable' });
@@ -1272,14 +1276,21 @@ describe('inventory tenants', () => {
       it('applies raises after the decreases of the same request, in either package order', async () => {
         const open = await available(tenant, TOKEN_GOAL, product);
         const a = Math.floor(open / 2);
-        const b = open - a;
+        // What is left beside the first half: the half paces to expected traffic, so it reads a little under the exact remainder.
+        const first = await pair('inventory-goal-update-half-001', [a]);
+        const b = await available(tenant, TOKEN_GOAL, product);
+        expect(b).toBeLessThan(open - a);
+        expect(b).toBeGreaterThan(Math.floor((open - a) * 0.9));
+        expectCanonical('update_media_buy', await update('inventory-goal-update-half-002', { media_buy_id: first.media_buy_id, canceled: true }));
         const created = await pair('inventory-goal-update-pair-001', [a, b]);
         const [idA, idB] = created.packages.map((pkg: Structured) => pkg.package_id);
-        expect(await available(tenant, TOKEN_GOAL, product)).toBe(0);
+        // Steps wider than the tolerance, so the exchange does not depend on where the bisection stopped.
+        const step = Math.max(1, Math.floor(0.0005 * open));
+        expect(await available(tenant, TOKEN_GOAL, product)).toBeLessThanOrEqual(Math.max(1, Math.floor(0.0005 * open)));
 
         const swap = await update('inventory-goal-update-swap-001', {
           media_buy_id: created.media_buy_id,
-          packages: [{ package_id: idA, impressions: a + 100 }, { package_id: idB, impressions: b - 100 }],
+          packages: [{ package_id: idA, impressions: a + step }, { package_id: idB, impressions: b - 2 * step }],
         });
         expectCanonical('update_media_buy', swap);
         const back = await update('inventory-goal-update-swap-002', {
@@ -1291,11 +1302,11 @@ describe('inventory tenants', () => {
 
         const both = await update('inventory-goal-update-both-0001', {
           media_buy_id: created.media_buy_id,
-          packages: [{ package_id: idA, impressions: a + 100 }, { package_id: idB, impressions: b + 100 }],
+          packages: [{ package_id: idA, impressions: a + step }, { package_id: idB, impressions: b + step }],
         });
         expect(errorOf(both)).toMatchObject({ code: 'PRODUCT_UNAVAILABLE' });
         expect((await reread(created.media_buy_id)).packages.map((pkg: Structured) => pkg.impressions)).toEqual([a, b]);
-        expect(await available(tenant, TOKEN_GOAL, product)).toBe(0);
+        expect(await available(tenant, TOKEN_GOAL, product)).toBeLessThanOrEqual(Math.max(1, Math.floor(0.0005 * open)));
         // Free the market for the next test.
         expectCanonical('update_media_buy', await update('inventory-goal-update-free-0001', { media_buy_id: created.media_buy_id, canceled: true }));
       });
@@ -1319,6 +1330,191 @@ describe('inventory tenants', () => {
         const packages = (await reread(pkgBuy.media_buy_id)).packages as Structured[];
         expect(packages.find(pkg => pkg.package_id === x)).toMatchObject({ canceled: true });
         expect(packages.find(pkg => pkg.package_id === y)?.canceled).not.toBe(true);
+      });
+    });
+
+    describe('/inventory-adserver flight-end changes', () => {
+      const tenant = 'inventory-adserver';
+      const TOKEN_GOAL = 'demo-inventory-goal-flightend-v1';
+      const product = 'ros_display_guaranteed';
+      const option = 'ros_display_guaranteed_cpm';
+      const twoWeeks = '2027-02-15T00:00:00Z';
+      beforeAll(() => prepare(tenant, TOKEN_GOAL));
+      const update = (key: string, patch: Record<string, unknown>) =>
+        call(tenant, 'update_media_buy', { idempotency_key: key, account: ACCOUNT, ...patch }, TOKEN_GOAL);
+      const reread = async (id: string) =>
+        (await call(tenant, 'get_media_buys', { account: ACCOUNT, media_buy_ids: [id] }, TOKEN_GOAL)).media_buys[0] as Structured;
+      const goalOf = (buy: Structured) => buy.packages[0].impressions as number;
+      const bookShare = async (key: string, share: number) => {
+        const open = await available(tenant, TOKEN_GOAL, product);
+        const created = await book(tenant, TOKEN_GOAL, key, product, option, Math.floor(open * share));
+        expectCanonical('create_media_buy', created);
+        return { created, goal: Math.floor(open * share) };
+      };
+
+      it('refuses a shortened end a goal cannot fit, and leaves the buy as it was', async () => {
+        const { created, goal } = await bookShare('inventory-goal-end-refuse-001', 0.75);
+        const before = await reread(created.media_buy_id);
+        const refused = await update('inventory-goal-end-refuse-002', { media_buy_id: created.media_buy_id, end_time: twoWeeks });
+        expect(errorOf(refused)).toMatchObject({ code: 'PRODUCT_UNAVAILABLE', field: 'end_time', recovery: 'correctable' });
+        const after = await reread(created.media_buy_id);
+        expect(after).toEqual(before);
+        expect(goalOf(after)).toBe(goal);
+        expectCanonical('update_media_buy', await update('inventory-goal-end-refuse-003', { media_buy_id: created.media_buy_id, canceled: true }));
+      });
+
+      it('accepts a shortened end the goal still fits', async () => {
+        const { created } = await bookShare('inventory-goal-end-fit-00001', 0.2);
+        const shortened = await update('inventory-goal-end-fit-00002', { media_buy_id: created.media_buy_id, end_time: twoWeeks });
+        expectCanonical('update_media_buy', shortened);
+        expect((await reread(created.media_buy_id)).end_time).toBe('2027-02-15T00:00:00.000Z');
+        expectCanonical('update_media_buy', await update('inventory-goal-end-fit-00003', { media_buy_id: created.media_buy_id, canceled: true }));
+      });
+
+      it('accepts a shortened end together with a lowered goal that fits it', async () => {
+        const { created } = await bookShare('inventory-goal-end-lower-0001', 0.75);
+        const lowered = Math.floor((await available(tenant, TOKEN_GOAL, product)) * 0.1);
+        const both = await update('inventory-goal-end-lower-0002', {
+          media_buy_id: created.media_buy_id, end_time: twoWeeks,
+          packages: [{ package_id: created.packages[0].package_id, impressions: lowered }],
+        });
+        expectCanonical('update_media_buy', both);
+        const after = await reread(created.media_buy_id);
+        expect(goalOf(after)).toBe(lowered);
+        expect(after.end_time).toBe('2027-02-15T00:00:00.000Z');
+        expectCanonical('update_media_buy', await update('inventory-goal-end-lower-0003', { media_buy_id: created.media_buy_id, canceled: true }));
+      });
+
+      it('weighs a raised goal and a shortened end together', async () => {
+        const { created, goal } = await bookShare('inventory-goal-end-raise-0001', 0.2);
+        const originalEnd = times.end_time;
+        const open = goal * 5;
+        const raise = Math.floor(open * 0.7);
+        const packages = [{ package_id: created.packages[0].package_id, impressions: raise }];
+        // Each change fits on its own.
+        expectCanonical('update_media_buy', await update('inventory-goal-end-raise-0002', { media_buy_id: created.media_buy_id, packages }));
+        expectCanonical('update_media_buy', await update('inventory-goal-end-raise-0003', {
+          media_buy_id: created.media_buy_id, packages: [{ package_id: created.packages[0].package_id, impressions: goal }],
+        }));
+        expectCanonical('update_media_buy', await update('inventory-goal-end-raise-0004', { media_buy_id: created.media_buy_id, end_time: twoWeeks }));
+        expectCanonical('update_media_buy', await update('inventory-goal-end-raise-0005', { media_buy_id: created.media_buy_id, end_time: originalEnd }));
+        const before = await reread(created.media_buy_id);
+        const together = await update('inventory-goal-end-raise-0006', { media_buy_id: created.media_buy_id, end_time: twoWeeks, packages });
+        expect(errorOf(together)).toMatchObject({ code: 'PRODUCT_UNAVAILABLE' });
+        expect(await reread(created.media_buy_id)).toEqual(before);
+        expectCanonical('update_media_buy', await update('inventory-goal-end-raise-0007', { media_buy_id: created.media_buy_id, canceled: true }));
+      });
+    });
+
+    describe('/inventory-adserver share-of-voice flight-end changes', () => {
+      const tenant = 'inventory-adserver';
+      const TOKEN_SOV = 'demo-inventory-sov-end-v1';
+      const product = 'homepage_takeover_daily';
+      const option = 'homepage_takeover_daily_cpm';
+      beforeAll(() => prepare(tenant, TOKEN_SOV));
+      const update = (key: string, patch: Record<string, unknown>) =>
+        call(tenant, 'update_media_buy', { idempotency_key: key, account: ACCOUNT, ...patch }, TOKEN_SOV);
+      const reread = async (id: string) =>
+        (await call(tenant, 'get_media_buys', { account: ACCOUNT, media_buy_ids: [id] }, TOKEN_SOV)).media_buys[0] as Structured;
+      const takeover = async (key: string, start: string, end: string) => {
+        const created = await call(tenant, 'create_media_buy', {
+          idempotency_key: key, account: ACCOUNT, brand: BRAND, start_time: start, end_time: end,
+          packages: [{ product_id: product, pricing_option_id: option, budget: 50_000 }],
+        }, TOKEN_SOV);
+        expectCanonical('create_media_buy', created);
+        return created;
+      };
+      const cancel = async (key: string, id: string) =>
+        expectCanonical('update_media_buy', await update(key, { media_buy_id: id, canceled: true }));
+
+      it('refuses an extension into days another takeover has sold, and leaves the buy as it was', async () => {
+        const first = await takeover('inventory-sov-end-sold-a-001', '2027-02-01T00:00:00Z', '2027-02-11T00:00:00Z');
+        const second = await takeover('inventory-sov-end-sold-b-001', '2027-02-21T00:00:00Z', '2027-03-01T00:00:00Z');
+        const before = await reread(first.media_buy_id);
+        const refused = await update('inventory-sov-end-sold-a-002', { media_buy_id: first.media_buy_id, end_time: '2027-02-26T00:00:00Z' });
+        expect(errorOf(refused)).toMatchObject({ code: 'PRODUCT_UNAVAILABLE', field: 'end_time', recovery: 'correctable' });
+        expect(await reread(first.media_buy_id)).toEqual(before);
+        await cancel('inventory-sov-end-sold-a-003', first.media_buy_id);
+        await cancel('inventory-sov-end-sold-b-002', second.media_buy_id);
+      });
+
+      it('accepts an extension that stops short of the next takeover, and a shortening', async () => {
+        const first = await takeover('inventory-sov-end-fit-a-0001', '2027-02-01T00:00:00Z', '2027-02-11T00:00:00Z');
+        const second = await takeover('inventory-sov-end-fit-b-0001', '2027-02-21T00:00:00Z', '2027-03-01T00:00:00Z');
+        const extended = await update('inventory-sov-end-fit-a-0002', { media_buy_id: first.media_buy_id, end_time: '2027-02-21T00:00:00Z' });
+        expectCanonical('update_media_buy', extended);
+        expect((await reread(first.media_buy_id)).end_time).toBe('2027-02-21T00:00:00.000Z');
+        const shortened = await update('inventory-sov-end-fit-a-0003', { media_buy_id: first.media_buy_id, end_time: '2027-02-06T00:00:00Z' });
+        expectCanonical('update_media_buy', shortened);
+        expect((await reread(first.media_buy_id)).end_time).toBe('2027-02-06T00:00:00.000Z');
+        await cancel('inventory-sov-end-fit-a-0004', first.media_buy_id);
+        await cancel('inventory-sov-end-fit-b-0002', second.media_buy_id);
+      });
+    });
+
+    describe('/inventory-content share-of-voice flight-end changes', () => {
+      const tenant = 'inventory-content';
+      const TOKEN_SOV = 'demo-inventory-sov-content-v1';
+      const podcast = { product_id: 'morning_brief_midroll', pricing_option_id: 'morning_brief_midroll_cpm', budget: 5000 };
+      const newsletter = { product_id: 'weekly_dispatch_sponsor', pricing_option_id: 'weekly_dispatch_sponsor_cpm', budget: 5000 };
+      beforeAll(() => prepare(tenant, TOKEN_SOV));
+
+      // A podcast sponsorship serves until its audience has built over 30 days and a newsletter's over 3, so one end_time
+      // shortens one of the two and extends the other.
+      // This guards acceptance in both package orders, not the sort itself.
+      it.each([
+        ['podcast then newsletter', [podcast, newsletter]],
+        ['newsletter then podcast', [newsletter, podcast]],
+      ])('accepts one end_time that shortens one sponsorship and extends the other (%s)', async (label, packages) => {
+        const key = label.split(' ')[0];
+        const created = await call(tenant, 'create_media_buy', {
+          idempotency_key: `inventory-sov-content-${key}-0001`, account: ACCOUNT, brand: BRAND, ...times, packages,
+        }, TOKEN_SOV);
+        expectCanonical('create_media_buy', created);
+        const moved = await call(tenant, 'update_media_buy', {
+          idempotency_key: `inventory-sov-content-${key}-0002`, account: ACCOUNT, media_buy_id: created.media_buy_id, end_time: '2027-03-15T00:00:00Z',
+        }, TOKEN_SOV);
+        expectCanonical('update_media_buy', moved);
+        const reread = (await call(tenant, 'get_media_buys', { account: ACCOUNT, media_buy_ids: [created.media_buy_id] }, TOKEN_SOV)).media_buys[0] as Structured;
+        expect(reread.packages.map((pkg: Structured) => pkg.end_time)).toEqual(['2027-03-15T00:00:00.000Z', '2027-03-15T00:00:00.000Z']);
+        expectCanonical('update_media_buy', await call(tenant, 'update_media_buy', {
+          idempotency_key: `inventory-sov-content-${key}-0003`, account: ACCOUNT, media_buy_id: created.media_buy_id, canceled: true,
+        }, TOKEN_SOV));
+      });
+    });
+
+    describe('/inventory-adserver resent end_time on a drifted buy', () => {
+      const tenant = 'inventory-adserver';
+      const TOKEN_GOAL = 'demo-inventory-goal-resend-v1';
+      const product = 'ros_display_guaranteed';
+      const option = 'ros_display_guaranteed_cpm';
+      beforeAll(() => prepare(tenant, TOKEN_GOAL));
+
+      it('accepts a resend of the current end_time on a two-package buy that has fallen behind', async () => {
+        const open = await available(tenant, TOKEN_GOAL, product);
+        // The first package paces to expected traffic and leaves about 4% less than the subtraction, so the pair fits up to 48.9% each.
+        const goal = Math.floor(open * 0.48);
+        const created = await call(tenant, 'create_media_buy', {
+          idempotency_key: 'inventory-goal-resend-a-0001', account: ACCOUNT, brand: BRAND, ...times,
+          packages: [
+            { product_id: product, pricing_option_id: option, budget: 1_000_000, impressions: goal },
+            { product_id: product, pricing_option_id: option, budget: 1_000_000, impressions: goal },
+          ],
+        }, TOKEN_GOAL);
+        expectCanonical('create_media_buy', created);
+
+        const clock = await call(tenant, 'comply_test_controller', {
+          scenario: 'sandbox_clock', account: ACCOUNT, params: { operation: 'advance_time', to: '2027-02-12T00:00:00Z' },
+        }, TOKEN_GOAL);
+        expect(clock.success, JSON.stringify(clock).slice(0, 500)).toBe(true);
+
+        const resent = await call(tenant, 'update_media_buy', {
+          idempotency_key: 'inventory-goal-resend-a-0002', account: ACCOUNT, media_buy_id: created.media_buy_id, end_time: times.end_time,
+        }, TOKEN_GOAL);
+        expectCanonical('update_media_buy', resent);
+        expectCanonical('update_media_buy', await call(tenant, 'update_media_buy', {
+          idempotency_key: 'inventory-goal-resend-a-0003', account: ACCOUNT, media_buy_id: created.media_buy_id, canceled: true,
+        }, TOKEN_GOAL));
       });
     });
 
@@ -1374,13 +1570,28 @@ describe('inventory tenants', () => {
       it('refuses a goal over the forecast and a second 75% goal', async () => {
         const open = await available(tenant, TOKEN_GOAL, product);
         expect(open).toBeGreaterThan(0);
-        const over = await book(tenant, TOKEN_GOAL, 'inventory-goal-content-over-0001', product, option, open + 1);
-        expect(errorOf(over)).toMatchObject({ code: 'PRODUCT_UNAVAILABLE', field: 'packages[0].impressions' });
+        const over = open + 1;
+        const refused = await book(tenant, TOKEN_GOAL, 'inventory-goal-content-over-0001', product, option, over);
+        expect(errorOf(refused)).toMatchObject({ code: 'PRODUCT_UNAVAILABLE', field: 'packages[0].impressions' });
 
         const share = Math.floor(open * 0.75);
         expectCanonical('create_media_buy', await book(tenant, TOKEN_GOAL, 'inventory-goal-content-a-00001', product, option, share));
         const second = await book(tenant, TOKEN_GOAL, 'inventory-goal-content-b-00001', product, option, share);
         expect(errorOf(second)).toMatchObject({ code: 'PRODUCT_UNAVAILABLE', field: 'packages[0].impressions' });
+      });
+
+      it('refuses a sponsorship that would leave a goal on the same cells short', async () => {
+        const open = await available(tenant, TOKEN_GOAL, product);
+        const goal = await book(tenant, TOKEN_GOAL, 'inventory-goal-content-c-00001', product, option, open);
+        expectCanonical('create_media_buy', goal);
+        const sponsorship = await call(tenant, 'create_media_buy', {
+          idempotency_key: 'inventory-goal-content-sov-0001', account: ACCOUNT, brand: BRAND, ...times,
+          packages: [{ product_id: 'weekly_dispatch_sponsor', pricing_option_id: 'weekly_dispatch_sponsor_cpm', budget: 5000 }],
+        }, TOKEN_GOAL);
+        expect(errorOf(sponsorship)).toMatchObject({ code: 'PRODUCT_UNAVAILABLE' });
+        expect(errorOf(sponsorship).message).toContain('other guaranteed bookings short');
+        const kept = (await call(tenant, 'get_media_buys', { account: ACCOUNT, media_buy_ids: [goal.media_buy_id] }, TOKEN_GOAL)).media_buys[0];
+        expect(kept.packages[0].impressions).toBe(open);
       });
     });
   });
