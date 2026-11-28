@@ -92,6 +92,19 @@ When the clock passes the end of a day, that day runs:
 
 Delivery is reported once the day has closed and the product's reporting delay has passed: the next day for the websites, a day later for the podcast and the creator series. A sponsorship package keeps delivering after its flight ends, while its installments' audience builds.
 
+### What a goal is checked against
+
+The impressions available to a guaranteed package with a goal come from a dry run of the days still to come. The dry run plays each day as above on forecast impressions, fractional and with no budget limit, and writes nothing. Takeovers and sponsorships take their share first. Goals are then served in the same order, each paced to expected traffic and drawing on the forecast. The package's available impressions are the largest goal it could hold such that it delivers as well as it would alone beside the takeovers and sponsorships, and no other guaranteed booking's undelivered impressions grow by more than half an impression. A package that is paused counts as active, because it can resume.
+
+Because pacing follows expected traffic while supply follows the forecast, the figure can sit below capacity minus your other goals. A goal that paces to expected traffic takes more than its forecast share on the days the forecast runs below expected and, because a goal never delivers ahead of its pace, the forecast's extra impressions on days it runs above expected go unsold when they come before the shortfall. [`get_products`](/docs/media-buy/task-reference/get_products) and the checks on [`create_media_buy`](/docs/media-buy/task-reference/create_media_buy) and [`update_media_buy`](/docs/media-buy/task-reference/update_media_buy) read the same figure, so a goal at the forecast's available is accepted and one more is not. The search stops within 0.05% of the largest goal that fits, so the figure reads at most that far under it.
+
+Two other changes are checked the same way, and a refusal leaves the booking as it was:
+
+- **A takeover or sponsorship** is refused with [`PRODUCT_UNAVAILABLE`](/docs/building/verification/compliance-catalog#error-code-product-unavailable) when it would leave another booking short of its goal, and its forecast shows 0 available. The check that the days are not already sold comes first.
+- **A flight end** that moves on a package with an impression goal, earlier or later, is refused when the package could no longer deliver what is left of its goal, or when the new end would starve another booking. Ending a flight today is refused while its goal is unmet. Cancel the package to stop it. A takeover's or sponsorship's end that moves later is checked for the added days only: it is refused when another takeover or sponsorship has sold them, or when it would leave another booking short of its goal. Shortening one is not checked.
+
+The engine version, `3`, covers these figures: a change to how they are found changes the version, and a market stored under another version restarts. See [Versions and the market reset](#versions-and-the-market-reset).
+
 ## How forecasts are wrong
 
 The forecast errors live in the actual traffic. The simulation draws each day's traffic with its deviations from the expected pattern already in it, and a forecast is the expected pattern plus whatever part of those deviations was known on the day it was made. A forecast made on a given day:
@@ -180,7 +193,7 @@ Results from these tenants depend on the engine and on the season. `sandbox_cloc
 - `engine_version`: the version of the engine's behaviour.
 - `seed_id` and `season_fingerprint`: the season's name, and a hash of every value in it.
 
-Record all three with every result, and compare only results that share them. A stored market restarts, discarding its bookings, seeded products and creatives, when the engine version, the season's `seed_id` or the season's fingerprint changes. Editing a local season file therefore restarts the stored market, even under the same `seed_id`. Give an edited season its own `seed_id` to name it. Hosted seasons are fixed. The engine version is `2` and the shipped seasons' ids are `adserver-2027-lead-time` and `content-2027-lead-time`, so a market stored under any other version or id on either tenant restarts once.
+Record all three with every result, and compare only results that share them. A stored market restarts, discarding its bookings, seeded products and creatives, when the engine version, the season's `seed_id` or the season's fingerprint changes. Editing a local season file therefore restarts the stored market, even under the same `seed_id`. Give an edited season its own `seed_id` to name it. Hosted seasons are fixed. The engine version is `3` and the shipped seasons' ids are `adserver-2027-lead-time` and `content-2027-lead-time`, so a market stored under any other version or id on either tenant restarts once.
 
 The guarantee that forecasts reveal none of the actual traffic holds within one timeline. Keep the test controller (the clock and `reset_state`) away from the agent under test.
 
@@ -290,6 +303,6 @@ To start from a shipped season instead of the starter, print one as YAML. The co
 npx tsx --input-type=module -e "import { seasonToYaml } from './server/src/training-agent/inventory-sim/season-file.js'; import { CONTENT_SEASON } from './server/src/training-agent/inventory-sim/engine/index.js'; process.stdout.write(seasonToYaml(CONTENT_SEASON))" > my-season.yaml
 ```
 
-To use the library directly, `traffic.day(d)` returns `expected` and `actual` tables. `ForecastResult.sigma` is the standard deviation of the forecast error on a log scale. Its `low` and `high` are built on capacity, net of bookings, and capped at what the budget buys. A forecast's clicks and conversions use the expected rates. To use a season without a server, read it with `readSeasonFile` from `server/src/training-agent/inventory-sim/season-file.ts`, and pass the result to `InventorySimulation.create(seed, nowMs)`, where `nowMs` is the start instant, from `server/src/training-agent/inventory-sim/engine/`.
+To use the library directly, `traffic.day(d)` returns `expected` and `actual` tables. `ForecastResult.sigma` is the standard deviation of the forecast error on a log scale. Its `low` and `high` are built on capacity, net of bookings, and capped at what the budget buys. Bookings here is `booked`, which is capacity minus available, so it counts the unsold slack described in [What a goal is checked against](#what-a-goal-is-checked-against) and can exceed the goals it nets. A forecast's clicks and conversions use the expected rates. To use a season without a server, read it with `readSeasonFile` from `server/src/training-agent/inventory-sim/season-file.ts`, and pass the result to `InventorySimulation.create(seed, nowMs)`, where `nowMs` is the start instant, from `server/src/training-agent/inventory-sim/engine/`.
 
 The engine behind these tenants lives in `server/src/training-agent/inventory-sim/engine/` and has no dependencies on the rest of the test agent, so it can move into `@adcp/sdk` if that proves useful.

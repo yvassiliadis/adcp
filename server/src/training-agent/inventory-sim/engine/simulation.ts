@@ -20,11 +20,14 @@
  */
 import {
   allocateAuction,
+  allocateFractionalHighWaterMark,
   allocateHighWaterMark,
   supplyOf,
+  takeFractionalShareOfVoice,
   takeShareOfVoice,
   type BidRequest,
   type CellCounts,
+  type FractionalGoalRequest,
   type GoalRequest,
 } from './allocation.js';
 import { EngineError } from './errors.js';
@@ -45,6 +48,65 @@ import type {
 
 /** z for a 10th–90th percentile forecast range. */
 const RANGE_Z = 1.2816;
+/** A dry run counts a booking as harmed when its undelivered impressions grow by more than this. */
+const DRY_TOLERANCE = 0.5;
+const DRY_EPSILON = 1e-9;
+const MAX_BISECTION_STEPS = 32;
+/** The bisection stops when the bracket is this narrow: 1 impression, or 0.05% of the upper end. */
+const BISECTION_TOLERANCE = 0.0005;
+const bisectionTolerance = (high: number): number => Math.max(1, Math.floor(BISECTION_TOLERANCE * high));
+/** Sorts after every real booking id. */
+const CANDIDATE_ID = '\uffffcandidate';
+
+/** The forecast one call reads. Only the default reader, which is a pure function of the day, lets the base run be memoised. */
+interface Reader {
+  read: ForecastReader;
+  memoise: boolean;
+}
+
+/** A booking as the dry run sees it. */
+interface DryBooking {
+  id: string;
+  kind: 'goal' | 'share_of_voice';
+  cells: readonly number[];
+  cellSet: ReadonlySet<number>;
+  /** First serving day, and one past the last inside the season. */
+  first: number;
+  last: number;
+  /** The flight's last day, exclusive: the pacing horizon. */
+  end: number;
+  /** Goals: impressions still to deliver when the booking enters. */
+  left: number;
+  /** Goals: running totals of expected traffic over the cells, as `expectedTotals` holds them. Pacing reads these, as `runDay` does. */
+  expected?: Float64Array;
+  share: number;
+  /** Sorts after bookings with an equal supply. */
+  tail?: boolean;
+}
+
+interface BaseRun {
+  books: DryBooking[];
+  from: number;
+  to: number;
+  /** Each goal's undelivered impressions after the last day. */
+  left: Float64Array;
+  /** Undelivered impressions at the start of each day from `from`. */
+  snapshots: Float64Array[];
+  /** Impressions every booking takes, per day and cell. */
+  held: Map<number, CellCounts>;
+}
+
+interface GoalAvailability {
+  available: number;
+  /** Forecast over the candidate's cells and days, before any booking. */
+  gross: number;
+  /** The part of `gross` that is not available, unrounded. */
+  held: number;
+  /** Calls `onTake` with the candidate's per-day, per-cell take when it holds `x`. */
+  takes: (x: number, onTake: (day: number, cell: number, count: number) => void) => void;
+  /** No booking meets the candidate, so `takes` reports its cells' forecast and sums to `available` to rounding. */
+  untouched: boolean;
+}
 
 export interface BookRequest {
   booking_id: string;
@@ -154,6 +216,17 @@ function positive(value: number | undefined, label: string): number {
   return value;
 }
 
+/**
+ * What a goal serves today out of its `left` undelivered impressions: its
+ * share of the expected traffic for the rest of the window, or an even split
+ * over the days left when the window expects none. That fallback is
+ * defensive: no seed reaches it, but installment cells can have none on days
+ * they serve. `runDay` rounds the result up; the dry run keeps it fractional.
+ */
+function pacedTarget(left: number, expectedToday: number, expectedWindow: number, daysLeft: number): number {
+  return expectedWindow > 0 ? (left * expectedToday) / expectedWindow : left / daysLeft;
+}
+
 function overlaps(a: readonly number[], b: ReadonlySet<number>): boolean {
   return a.some(cell => b.has(cell));
 }
@@ -167,6 +240,12 @@ export class InventorySimulation {
    * is read live. Pacing reads expected traffic, not an as-of forecast, so
    * the totals never depend on the day they are read. */
   private readonly expectedPrefix = new Map<string, Float64Array>();
+  private readonly cellSets = new WeakMap<readonly number[], ReadonlySet<number>>();
+  private readonly memo = new Map<string, BaseRun>();
+  private memoStamp = '';
+  private revision = 0;
+  private dryRunCount = 0;
+  private bookingsRun = 0;
 
   /** `products` are sold beside the seed's own, on its placements. */
   constructor(readonly seed: SeasonSeed, readonly state: SimulationState, products: readonly SeedProduct[] = []) {
@@ -228,6 +307,15 @@ export class InventorySimulation {
 
   book(request: BookRequest, nowMs: number): Booking {
     this.advanceTo(nowMs);
+    this.revision += 1;
+    try {
+      return this.place(request, nowMs);
+    } finally {
+      this.revision += 1;
+    }
+  }
+
+  private place(request: BookRequest, nowMs: number): Booking {
     if (this.state.bookings.some(booking => booking.booking_id === request.booking_id)) {
       throw new EngineError('DUPLICATE_BOOKING', `Booking ${request.booking_id} already exists`);
     }
@@ -274,43 +362,115 @@ export class InventorySimulation {
       if (sold + booking.share_of_voice > 1 + 1e-9) {
         throw new EngineError('SOLD_OUT', `Product ${product.product_id} is already sold for part of this flight`);
       }
+      const today = this.today(nowMs);
+      const { first, last } = this.servingDays(booking, today);
+      const candidate = this.candidateOf(cells, first, last, end, 'share_of_voice', booking.share_of_voice, booking.booking_id);
+      if (this.harmsGoals(candidate, today, this.readerFor(today))) {
+        throw new EngineError('INSUFFICIENT_INVENTORY',
+          `Product ${product.product_id} would leave other guaranteed bookings short of their impression goals for this flight and targeting`);
+      }
     }
     this.cellCache.set(booking.booking_id, cells);
     this.state.bookings.push(booking);
     return booking;
   }
 
+  /**
+   * Change a booking. Every field is validated first. A goal booking whose
+   * goal rose or whose last day moved is then checked once, as it would be
+   * after the change, so a refusal leaves it untouched.
+   */
   update(bookingId: string, patch: BookingPatch, nowMs: number): Booking {
     this.advanceTo(nowMs);
     const booking = this.booking(bookingId);
     if (booking.status === 'canceled') throw new EngineError('INVALID_BOOKING', `Booking ${bookingId} is canceled`);
-    // The goal goes first, so a refused raise leaves the booking unchanged.
-    if (patch.impression_goal !== undefined) {
-      if (booking.kind !== 'goal') throw new EngineError('INVALID_BOOKING', 'Only goal bookings have an impression goal');
-      const goal = Math.floor(positive(patch.impression_goal, 'impression_goal'));
-      if (goal > (booking.impression_goal ?? 0)) this.requireAvailable(booking, this.cellsFor(booking), goal, nowMs);
-      booking.impression_goal = goal;
+    this.revision += 1;
+    try {
+      let goal: number | undefined;
+      if (patch.impression_goal !== undefined) {
+        if (booking.kind !== 'goal') throw new EngineError('INVALID_BOOKING', 'Only goal bookings have an impression goal');
+        goal = Math.floor(positive(patch.impression_goal, 'impression_goal'));
+      }
+      const budget = patch.budget !== undefined ? positive(patch.budget, 'budget') : undefined;
+      let bid: number | undefined;
+      if (patch.bid_cpm !== undefined) {
+        if (booking.kind !== 'auction') throw new EngineError('INVALID_BOOKING', 'Only non-guaranteed bookings bid');
+        bid = positive(patch.bid_cpm, 'bid_cpm');
+      }
+      let endDay: number | undefined;
+      if (patch.flight_end_ms !== undefined) {
+        endDay = this.flightDays(this.traffic.calendar.startMs + booking.flight_start_day * 86_400_000, patch.flight_end_ms).end;
+      }
+      if (booking.kind === 'goal') {
+        const raised = goal !== undefined && goal > (booking.impression_goal ?? 0);
+        const moved = endDay !== undefined && endDay !== booking.flight_end_day;
+        if (raised || moved) {
+          this.requireAvailable({ ...booking, flight_end_day: endDay ?? booking.flight_end_day }, this.cellsFor(booking), goal ?? booking.impression_goal ?? 0, nowMs);
+        }
+      }
+      if (booking.kind === 'share_of_voice' && endDay !== undefined && endDay > booking.flight_end_day && patch.status !== 'canceled') {
+        this.requireExtensionFits(booking, endDay, nowMs);
+      }
+      if (goal !== undefined) booking.impression_goal = goal;
+      if (budget !== undefined) booking.budget = budget;
+      if (bid !== undefined) booking.cpm = bid;
+      if (endDay !== undefined) booking.flight_end_day = endDay;
+      if (patch.status !== undefined) booking.status = patch.status;
+      return booking;
+    } finally {
+      this.revision += 1;
     }
-    if (patch.budget !== undefined) booking.budget = positive(patch.budget, 'budget');
-    if (patch.bid_cpm !== undefined) {
-      if (booking.kind !== 'auction') throw new EngineError('INVALID_BOOKING', 'Only non-guaranteed bookings bid');
-      booking.cpm = positive(patch.bid_cpm, 'bid_cpm');
+  }
+
+  /**
+   * Refuse a share-of-voice booking whose end moves later when the added days
+   * are already sold to another share-of-voice booking on the same cells, or
+   * when holding them would leave a goal short. Only the added days are
+   * weighed: the booking is already in the market for the days it has, and days
+   * before today are past selling. The sold-share range is clamped to the
+   * season while book() counts past the season end, which only matters for
+   * flights that run past the season end.
+   */
+  private requireExtensionFits(booking: Booking, endDay: number, nowMs: number): void {
+    const addedFrom = booking.flight_end_day;
+    const addedTo = Math.min(endDay, this.traffic.calendar.days);
+    if (addedFrom >= addedTo) return;
+    const cells = this.cellsFor(booking);
+    const share = booking.share_of_voice ?? 0;
+    const today = this.today(nowMs);
+    const soldFrom = Math.max(addedFrom, today);
+    if (soldFrom < addedTo) {
+      const mine = new Set(cells);
+      const sold = this.state.bookings
+        .filter(other => other.kind === 'share_of_voice' && other.status !== 'canceled' && other.booking_id !== booking.booking_id
+          && other.flight_start_day < addedTo && soldFrom < other.flight_end_day
+          && overlaps(this.cellsFor(other), mine))
+        .reduce((sum, other) => sum + (other.share_of_voice ?? 0), 0);
+      if (sold + share > 1 + 1e-9) {
+        throw new EngineError('SOLD_OUT', `Product ${booking.product_id} is already sold for part of the added days`);
+      }
     }
-    if (patch.flight_end_ms !== undefined) {
-      const { end } = this.flightDays(this.traffic.calendar.startMs + booking.flight_start_day * 86_400_000, patch.flight_end_ms);
-      booking.flight_end_day = end;
+    const { first, last } = this.servingDays({ ...booking, flight_end_day: endDay }, today);
+    const from = Math.max(first, addedFrom);
+    if (from >= last) return;
+    const candidate = this.candidateOf(cells, from, last, endDay, 'share_of_voice', share);
+    if (this.harmsGoals(candidate, today, this.readerFor(today))) {
+      throw new EngineError('INSUFFICIENT_INVENTORY',
+        `Extending ${booking.booking_id} would leave other guaranteed bookings short of their impression goals`);
     }
-    if (patch.status !== undefined) booking.status = patch.status;
-    return booking;
+  }
+
+  private expectedPrefixOf(cells: readonly number[]): Float64Array {
+    const { days } = this.traffic.calendar;
+    const prefix = new Float64Array(days + 1);
+    for (let d = 0; d < days; d++) prefix[d + 1] = prefix[d] + supplyOf(this.traffic.day(d).expected, cells);
+    return prefix;
   }
 
   private expectedTotals(booking: Pick<Booking, 'booking_id' | 'product_id' | 'targeting'>): Float64Array {
     let prefix = this.expectedPrefix.get(booking.booking_id);
     if (!prefix) {
-      const cells = this.cellsFor(booking);
-      const { days } = this.traffic.calendar;
-      prefix = new Float64Array(days + 1);
-      for (let d = 0; d < days; d++) prefix[d + 1] = prefix[d] + supplyOf(this.traffic.day(d).expected, cells);
+      prefix = this.expectedPrefixOf(this.cellsFor(booking));
       this.expectedPrefix.set(booking.booking_id, prefix);
     }
     return prefix;
@@ -335,15 +495,13 @@ export class InventorySimulation {
       const left = Math.max(0, (booking.impression_goal ?? 0) - booking.delivered.impressions);
       const affordable = Math.floor(((booking.budget - booking.delivered.spend) * 1000) / booking.cpm + 1e-9);
       // What is left is spread over the days [day, end) in proportion to expected
-      // traffic. The even split when the window expects none is defensive: no
-      // seed reaches it, but installment cells can have none on days they serve.
+      // traffic.
       const prefix = this.expectedTotals(booking);
       const end = Math.min(booking.flight_end_day, calendar.days);
       const expectedToday = prefix[day + 1] - prefix[day];
       const sumF = prefix[end] - prefix[day];
-      const planned = sumF > 0
-        ? Math.ceil((left * expectedToday) / sumF - 1e-9)
-        : Math.ceil(left / (booking.flight_end_day - day));
+      const paced = pacedTarget(left, expectedToday, sumF, booking.flight_end_day - day);
+      const planned = Math.ceil(sumF > 0 ? paced - 1e-9 : paced);
       const target = Math.max(0, Math.min(left, planned, affordable));
       targets.set(booking.booking_id, target);
       goals.push({ id: booking.booking_id, cells: this.cellsFor(booking), target });
@@ -449,97 +607,364 @@ export class InventorySimulation {
     };
   }
 
-  /**
-   * Reserved impressions per day and cell over the days [first, last), from
-   * the guaranteed bookings still to serve, less `except`. A goal booking
-   * spreads what is left of its goal over its own serving days wherever the
-   * window starts, so a window that opens mid-flight holds only the part
-   * that falls inside it. `forecastOf` reads the forecast, by default as
-   * known on `today`.
-   */
-  private reservations(
-    today: number,
-    first: number,
-    last: number,
-    except?: string,
-    forecastOf: ForecastReader = this.forecastReader(today),
-  ): Map<number, CellCounts> {
-    const reserved = new Map<number, CellCounts>();
-    const add = (day: number, cell: number, value: number) => {
-      let counts = reserved.get(day);
-      if (!counts) reserved.set(day, (counts = new Map()));
-      counts.set(cell, (counts.get(cell) ?? 0) + value);
-    };
-    for (const booking of this.state.bookings) {
-      if (booking.status === 'canceled' || booking.kind === 'auction' || booking.booking_id === except) continue;
-      const own = this.servingDays(booking, today);
-      const from = Math.max(first, own.first);
-      const to = Math.min(last, own.last);
-      const cells = this.cellsFor(booking);
-      if (booking.kind === 'share_of_voice') {
-        for (let day = from; day < to; day++) {
-          for (const cell of cells) {
-            const value = forecastOf(day, cell);
-            if (value !== 0) add(day, cell, (booking.share_of_voice ?? 0) * value);
-          }
-        }
-        continue;
-      }
-      const left = Math.max(0, (booking.impression_goal ?? 0) - booking.delivered.impressions);
-      let total = 0;
-      for (let day = own.first; day < own.last; day++) for (const cell of cells) total += forecastOf(day, cell);
-      if (total === 0 || left === 0) continue;
-      const share = Math.min(1, left / total);
-      for (let day = from; day < to; day++) {
-        for (const cell of cells) {
-          const value = forecastOf(day, cell);
-          if (value !== 0) add(day, cell, share * value);
-        }
-      }
-    }
-    return reserved;
+  /** The forecast one call reads: `forecastOf` when given, else the default as known on `today`. Only the default lets the base run be memoised. */
+  private readerFor(today: number, forecastOf?: ForecastReader): Reader {
+    return forecastOf ? { read: forecastOf, memoise: false } : { read: this.forecastReader(today), memoise: true };
   }
 
-  /**
-   * Forecast impressions over `cells` and the days [first, last) as known
-   * on `today`, and the part of them guaranteed bookings other than `except`
-   * hold. `free` sees each day and cell with impressions left over.
-   * `forecastOf` reads the forecast, by default as known on `today`.
-   * Forecasts sum unrounded values, while actual traffic is rounded per
-   * cell and cells under 0.5 are dropped, so a goal booked at exactly
-   * `available` with zero error can miss by a few impressions.
-   */
-  private netForecast(
+  private cellSetOf(cells: readonly number[]): ReadonlySet<number> {
+    let set = this.cellSets.get(cells);
+    if (!set) this.cellSets.set(cells, (set = new Set(cells)));
+    return set;
+  }
+
+  private candidateOf(
     cells: readonly number[],
     first: number,
     last: number,
-    today: number,
-    except?: string,
-    free?: (day: number, cell: number, impressions: number) => void,
-    forecastOf: ForecastReader = this.forecastReader(today),
-  ): { capacity: number; booked: number; available: number } {
-    const reserved = this.reservations(today, first, last, except, forecastOf);
-    let capacity = 0;
-    let booked = 0;
-    for (let day = first; day < last; day++) {
-      const held = reserved.get(day);
-      for (const cell of cells) {
-        const value = forecastOf(day, cell);
-        if (value === 0) continue;
-        const taken = Math.min(value, held?.get(cell) ?? 0);
-        capacity += value;
-        booked += taken;
-        if (value > taken) free?.(day, cell, value - taken);
-      }
-    }
-    return { capacity, booked, available: Math.max(0, Math.round(capacity - booked)) };
+    end: number,
+    kind: DryBooking['kind'],
+    share = 0,
+    id = CANDIDATE_ID,
+  ): DryBooking {
+    // Built fresh each time: the candidate's id is shared by every check, so the per-booking cache cannot hold its prefix.
+    const expected = kind === 'goal' ? this.expectedPrefixOf(cells) : undefined;
+    return { id, kind, cells, cellSet: this.cellSetOf(cells), first, last, end, left: 0, expected, share, tail: true };
   }
 
   /**
-   * Refuse a goal whose undelivered part is more than the forecast leaves
-   * the booking over its serving days, net of every other guaranteed
-   * booking: the `available` a forecast for the same cells and flight
-   * reports. A guarantee the market cannot cover is refused, never capped.
+   * The guaranteed bookings a dry run models, each entering on its first
+   * serving day from `today`. Paused bookings count as active because they
+   * may resume; canceled and auction bookings reserve nothing.
+   */
+  private dryBookings(today: number, except?: string): DryBooking[] {
+    const books: DryBooking[] = [];
+    for (const booking of this.state.bookings) {
+      if (booking.status === 'canceled' || booking.kind === 'auction' || booking.booking_id === except) continue;
+      const { first, last } = this.servingDays(booking, today);
+      if (first >= last) continue;
+      const cells = this.cellsFor(booking);
+      const common = { id: booking.booking_id, cells, cellSet: this.cellSetOf(cells), first, last, end: booking.flight_end_day };
+      if (booking.kind === 'share_of_voice') {
+        books.push({ ...common, kind: 'share_of_voice', left: 0, share: booking.share_of_voice ?? 0 });
+        continue;
+      }
+      const left = Math.max(0, (booking.impression_goal ?? 0) - booking.delivered.impressions);
+      if (left > DRY_EPSILON) books.push({ ...common, kind: 'goal', left, expected: this.expectedTotals(booking), share: 0 });
+    }
+    return books;
+  }
+
+  /** `except`, or undefined when it names no booking a dry run models. */
+  private liveExcept(except: string | undefined): string | undefined {
+    if (except === undefined) return undefined;
+    const live = this.state.bookings.some(booking => booking.booking_id === except
+      && booking.status !== 'canceled' && booking.kind !== 'auction');
+    return live ? except : undefined;
+  }
+
+  private interacts(a: DryBooking, b: DryBooking): boolean {
+    return a.first < b.last && b.first < a.last && a.cells.some(cell => b.cellSet.has(cell));
+  }
+
+  /** Indices of the bookings that share a cell and a day with `candidate`, directly or through each other. */
+  private componentOf(books: readonly DryBooking[], candidate: DryBooking): number[] {
+    const members: number[] = [];
+    const seen = new Set<number>();
+    const queue: DryBooking[] = [candidate];
+    for (let next = queue.pop(); next; next = queue.pop()) {
+      books.forEach((book, index) => {
+        if (seen.has(index) || !this.interacts(next!, book)) return;
+        seen.add(index);
+        members.push(index);
+        queue.push(book);
+      });
+    }
+    return members.sort((a, b) => a - b);
+  }
+
+  /**
+   * The cells a dry run allocates over, as units with their forecast for each
+   * day in [from, to). With `merge` set, cells held by exactly the same
+   * bookings form one unit: every allocation takes the same share of each of
+   * them, so a unit behaves as the sum of its cells. Without it each cell is
+   * its own unit, which is what a run that reports per-cell takes needs.
+   */
+  private unitsFor(
+    books: readonly DryBooking[],
+    from: number,
+    to: number,
+    read: ForecastReader,
+    merge: boolean,
+  ): { unitsOf: number[][]; values: Map<number, Float64Array> } {
+    const span = Math.max(0, to - from);
+    const unitsOf: number[][] = books.map(() => []);
+    const values = new Map<number, Float64Array>();
+    const sum = (cells: readonly number[]) => {
+      const perDay = new Float64Array(span);
+      for (let d = 0; d < span; d++) for (const cell of cells) perDay[d] += read(from + d, cell);
+      return perDay;
+    };
+    if (!merge) {
+      books.forEach((book, i) => {
+        unitsOf[i] = book.cells as number[];
+        for (const cell of book.cells) if (!values.has(cell)) values.set(cell, sum([cell]));
+      });
+      return { unitsOf, values };
+    }
+    const owners = new Map<number, number[]>();
+    books.forEach((book, i) => {
+      for (const cell of book.cells) {
+        const held = owners.get(cell);
+        if (held) held.push(i);
+        else owners.set(cell, [i]);
+      }
+    });
+    const bySignature = new Map<string, { unit: number; cells: number[] }>();
+    for (const [cell, held] of owners) {
+      const signature = held.join(',');
+      let group = bySignature.get(signature);
+      if (!group) {
+        group = { unit: bySignature.size, cells: [] };
+        bySignature.set(signature, group);
+        for (const i of held) unitsOf[i].push(group.unit);
+      }
+      group.cells.push(cell);
+    }
+    for (const { unit, cells } of bySignature.values()) values.set(unit, sum(cells));
+    return { unitsOf, values };
+  }
+
+  /**
+   * A dry run of `runDay` over the days [from, to), into the supply `read`
+   * returns: share-of-voice bookings take their share of each cell by id, then
+   * goal bookings are served by the high-water mark method, each paced to
+   * expected traffic as `runDay` paces it.
+   * Impressions are fractional, budgets are not applied, and nothing is written to the state or the traffic tables.
+   * `left` holds each goal's undelivered impressions and is updated.
+   */
+  private simulate(
+    books: readonly DryBooking[],
+    from: number,
+    to: number,
+    left: Float64Array,
+    read: ForecastReader,
+    hooks: { snapshots?: Float64Array[]; observe?: (index: number, day: number, cell: number, count: number) => void } = {},
+  ): void {
+    this.dryRunCount += 1;
+    const indexOf = new Map(books.map((book, index) => [book.id, index]));
+    const indices = books.map((_, index) => index);
+    const shares = indices.filter(i => books[i].kind === 'share_of_voice').sort((a, b) => (books[a].id < books[b].id ? -1 : 1));
+    const goals = indices.filter(i => books[i].kind === 'goal');
+    const { unitsOf, values } = this.unitsFor(books, from, to, read, hooks.observe === undefined);
+    const { calendar } = this.traffic;
+    const expected = (i: number, day: number) => books[i].expected![day];
+    for (let day = from; day < to; day++) {
+      hooks.snapshots?.push(left.slice());
+      const sharesToday = shares.filter(i => books[i].first <= day && day < books[i].last);
+      const goalsToday = goals.filter(i => books[i].first <= day && day < books[i].last && left[i] > DRY_EPSILON);
+      if (sharesToday.length + goalsToday.length === 0) continue;
+      const actual: CellCounts = new Map();
+      for (const i of [...sharesToday, ...goalsToday]) {
+        for (const unit of unitsOf[i]) if (!actual.has(unit)) actual.set(unit, values.get(unit)![day - from]);
+      }
+      const remaining: CellCounts = new Map(actual);
+      for (const i of sharesToday) {
+        const taken = takeFractionalShareOfVoice(remaining, actual, unitsOf[i], books[i].share);
+        if (hooks.observe) for (const [cell, count] of taken) hooks.observe(i, day, cell, count);
+      }
+      const requests: FractionalGoalRequest[] = goalsToday.map(i => ({
+        id: books[i].id,
+        cells: unitsOf[i],
+        last: books[i].tail === true,
+        target: pacedTarget(left[i], expected(i, day + 1) - expected(i, day), expected(i, Math.min(books[i].end, calendar.days)) - expected(i, day), books[i].end - day),
+      }));
+      for (const [id, taken] of allocateFractionalHighWaterMark(remaining, requests)) {
+        const index = indexOf.get(id)!;
+        let total = 0;
+        for (const [cell, count] of taken) {
+          total += count;
+          hooks.observe?.(index, day, cell, count);
+        }
+        left[index] = Math.max(0, left[index] - total);
+      }
+    }
+  }
+
+  /**
+   * The dry run with no candidate, memoised per (today, processed day,
+   * booking revision, `except`). Only the default reader is memoised: a
+   * caller-supplied `forecastOf` is never.
+   */
+  private baseRun(today: number, except: string | undefined, reader: Reader): BaseRun {
+    const stamp = `${today}|${this.state.processed_through_day}|${this.revision}`;
+    if (stamp !== this.memoStamp) {
+      this.memo.clear();
+      this.memoStamp = stamp;
+    }
+    const key = except ?? '';
+    const cached = reader.memoise ? this.memo.get(key) : undefined;
+    if (cached) return cached;
+    const books = this.dryBookings(today, except);
+    const from = books.length > 0 ? Math.min(...books.map(book => book.first)) : today;
+    const to = books.length > 0 ? Math.max(...books.map(book => book.last)) : today;
+    const left = Float64Array.from(books, book => book.left);
+    const snapshots: Float64Array[] = [];
+    const held = new Map<number, CellCounts>();
+    this.simulate(books, from, to, left, reader.read, {
+      snapshots,
+      observe: (_index, day, cell, count) => {
+        let counts = held.get(day);
+        if (!counts) held.set(day, (counts = new Map()));
+        counts.set(cell, (counts.get(cell) ?? 0) + count);
+      },
+    });
+    const run: BaseRun = { books, from, to, left, snapshots, held };
+    if (reader.memoise) this.memo.set(key, run);
+    return run;
+  }
+
+  /** What booking `index` still has to deliver at the start of `day` in the base run. */
+  private leftAt(run: BaseRun, day: number, index: number): number {
+    if (day <= run.from) return run.books[index].left;
+    if (day >= run.to) return run.left[index];
+    return run.snapshots[day - run.from][index];
+  }
+
+  /** The base run's bookings that can meet the candidate, with what each still has to deliver on its first day. */
+  private neighbours(run: BaseRun, candidate: DryBooking): { members: DryBooking[]; indices: number[]; start: number[] } {
+    const indices = this.componentOf(run.books, candidate);
+    return {
+      members: indices.map(index => run.books[index]),
+      indices,
+      start: indices.map(index => this.leftAt(run, candidate.first, index)),
+    };
+  }
+
+  /** Runs the members and the candidate from the candidate's first day, the candidate needing `x` impressions. */
+  private runWith(
+    members: readonly DryBooking[],
+    start: readonly number[],
+    candidate: DryBooking,
+    x: number,
+    read: ForecastReader,
+    observe?: (index: number, day: number, cell: number, count: number) => void,
+  ): Float64Array {
+    const books = [...members, candidate];
+    this.bookingsRun += books.length;
+    const left = Float64Array.from([...start, x]);
+    this.simulate(books, candidate.first, Math.max(...books.map(book => book.last)), left, read, { observe });
+    return left;
+  }
+
+  /** Forecast impressions over the candidate's cells and days, and the part share-of-voice bookings leave. */
+  private forecastOver(candidate: DryBooking, read: ForecastReader, shares: readonly DryBooking[]): { gross: number; net: number } {
+    let gross = 0;
+    let net = 0;
+    for (let day = candidate.first; day < candidate.last; day++) {
+      for (const cell of candidate.cells) {
+        const value = read(day, cell);
+        if (value <= 0) continue;
+        let share = 0;
+        for (const other of shares) if (other.first <= day && day < other.last && other.cellSet.has(cell)) share += other.share;
+        gross += value;
+        net += value * (1 - Math.min(1, share));
+      }
+    }
+    return { gross, net };
+  }
+
+  /**
+   * Whether the candidate can hold `x` impressions: its dry-run shortfall
+   * grows by no more than the tolerance over its shortfall running alone with
+   * the share-of-voice bookings, and no other goal booking's shortfall grows
+   * by more than the tolerance over the base run's.
+   */
+  private fits(
+    run: BaseRun,
+    near: { members: DryBooking[]; indices: number[]; start: number[] },
+    candidate: DryBooking,
+    x: number,
+    read: ForecastReader,
+  ): boolean {
+    const { members, indices, start } = near;
+    const left = this.runWith(members, start, candidate, x, read);
+    for (let k = 0; k < members.length; k++) {
+      if (members[k].kind === 'goal' && left[k] - run.left[indices[k]] > DRY_TOLERANCE) return false;
+    }
+    const keep = members.map((_, k) => k).filter(k => members[k].kind === 'share_of_voice');
+    const alone = this.runWith(keep.map(k => members[k]), keep.map(() => 0), candidate, x, read);
+    return left[members.length] - alone[keep.length] <= DRY_TOLERANCE;
+  }
+
+  /**
+   * The most a goal booking with the candidate's cells and days can still
+   * hold: the largest whole number of impressions such that, entering with
+   * that many left, it delivers as well as it would alone and leaves every
+   * other goal as well served as before. `except` is a booking to leave out.
+   * With no booking sharing a cell and day it is the forecast the
+   * share-of-voice bookings leave. Otherwise it is found by bisection, at
+   * most 32 dry runs from the candidate's first day. It stops when the bracket is
+   * within max(1, 0.05% of the upper end) and returns the feasible lower end,
+   * so the number is conservative by at most that much.
+   */
+  private goalAvailable(candidate: DryBooking, today: number, except: string | undefined, reader: Reader): GoalAvailability {
+    const leave = this.liveExcept(except);
+    const direct = this.dryBookings(today, leave).filter(book => this.interacts(candidate, book));
+    const { gross, net } = this.forecastOver(candidate, reader.read, direct.filter(book => book.kind === 'share_of_voice'));
+    const upper = Math.round(net);
+    if (upper <= 0) return { available: 0, gross, held: gross - Math.max(0, net), takes: () => {}, untouched: false };
+    const takesWith = (near: { members: DryBooking[]; start: number[] }) =>
+      (x: number, onTake: (day: number, cell: number, count: number) => void) => {
+        if (x <= 0) return;
+        const last = near.members.length;
+        this.runWith(near.members, near.start, candidate, x, reader.read, (index, day, cell, count) => {
+          if (index === last) onTake(day, cell, count);
+        });
+      };
+    if (direct.length === 0) {
+      const forecastTakes = (_x: number, onTake: (day: number, cell: number, count: number) => void) => {
+        for (let day = candidate.first; day < candidate.last; day++) {
+          for (const cell of candidate.cells) {
+            const value = reader.read(day, cell);
+            if (value > 0) onTake(day, cell, value);
+          }
+        }
+      };
+      return { available: upper, gross, held: gross - net, takes: forecastTakes, untouched: true };
+    }
+    const run = this.baseRun(today, leave, reader);
+    const near = this.neighbours(run, candidate);
+    let low = 0;
+    let high = upper;
+    let available = upper;
+    if (!this.fits(run, near, candidate, upper, reader.read)) {
+      for (let step = 0; step < MAX_BISECTION_STEPS && high - low > bisectionTolerance(high); step++) {
+        const mid = Math.floor((low + high) / 2);
+        if (this.fits(run, near, candidate, mid, reader.read)) low = mid;
+        else high = mid;
+      }
+      available = low;
+    }
+    return { available, gross, held: gross - (available === upper ? net : available), takes: takesWith(near), untouched: false };
+  }
+
+  /** Whether a share-of-voice booking would leave a goal booking worse served than it is. */
+  private harmsGoals(candidate: DryBooking, today: number, reader: Reader): boolean {
+    const direct = this.componentOf(this.dryBookings(today), candidate);
+    if (direct.length === 0) return false;
+    const run = this.baseRun(today, undefined, reader);
+    const near = this.neighbours(run, candidate);
+    if (!near.members.some(book => book.kind === 'goal')) return false;
+    const left = this.runWith(near.members, near.start, candidate, 0, reader.read);
+    return near.members.some((book, k) => book.kind === 'goal' && left[k] - run.left[near.indices[k]] > DRY_TOLERANCE);
+  }
+
+  /**
+   * Refuse a goal whose undelivered part is more than the booking can hold
+   * over its serving days, net of every other guaranteed booking: the
+   * `available` a forecast for the same cells and flight reports. A
+   * guarantee the market cannot cover is refused, never capped.
    */
   private requireAvailable(
     booking: Booking,
@@ -549,23 +974,62 @@ export class InventorySimulation {
     forecastOf?: ForecastReader,
   ): void {
     const today = this.today(nowMs);
-    const { first, last } = this.servingDays(booking, today);
-    const { available } = this.netForecast(cells, first, last, today, booking.booking_id, undefined, forecastOf);
     const left = goal - booking.delivered.impressions;
+    if (left <= 0) return;
+    const { first, last } = this.servingDays(booking, today);
+    const candidate = this.candidateOf(cells, first, last, booking.flight_end_day, 'goal');
+    const { available } = this.goalAvailable(candidate, today, booking.booking_id, this.readerFor(today, forecastOf));
     if (left <= available) return;
     const delivered = booking.delivered.impressions > 0 ? ` (${left} still to deliver)` : '';
     throw new EngineError('INSUFFICIENT_INVENTORY',
       `Requested ${goal} impressions${delivered}, but only ${available} are available on ${booking.product_id} for this flight and targeting`);
   }
 
-  /** Refuse a goal booking whose undelivered goal the forecast no longer
-   * covers: the check `update` runs on a raise. A host that applies several
-   * changes as one runs it on each goal they raised, once all are in. */
+  /** Refuse a goal booking whose undelivered goal the market no longer
+   * covers: the check `update` runs on a raise or a moved end. A host that
+   * applies several changes as one runs it on each goal they raised or
+   * shortened, once all are in. */
   requireGoalAvailable(bookingId: string, nowMs: number): void {
     this.advanceTo(nowMs);
     const booking = this.booking(bookingId);
     if (booking.kind !== 'goal' || booking.status === 'canceled') return;
     this.requireAvailable(booking, this.cellsFor(booking), booking.impression_goal ?? 0, nowMs);
+  }
+
+  /**
+   * The impressions a goal booking could still hold over its serving days
+   * with its own reservation set aside: what `update` weighs a goal against.
+   * A booking holding `delivered + bookingAvailable` is the largest goal an
+   * update accepts.
+   *
+   * @internal Exists for tests and measurement.
+   */
+  bookingAvailable(bookingId: string, nowMs: number): number {
+    this.advanceTo(nowMs);
+    const booking = this.booking(bookingId);
+    if (booking.kind !== 'goal' || booking.status === 'canceled') {
+      throw new EngineError('INVALID_BOOKING', `Booking ${bookingId} is not an active goal booking`);
+    }
+    const today = this.today(nowMs);
+    const { first, last } = this.servingDays(booking, today);
+    const candidate = this.candidateOf(this.cellsFor(booking), first, last, booking.flight_end_day, 'goal');
+    return this.goalAvailable(candidate, today, booking.booking_id, this.readerFor(today)).available;
+  }
+
+  /**
+   * Dry runs run so far: a measure of what the checks and forecasts cost.
+   * @internal Exists for tests and measurement.
+   */
+  get dryRuns(): number {
+    return this.dryRunCount;
+  }
+
+  /**
+   * Bookings simulated across the candidate dry runs so far: what component pruning keeps small.
+   * @internal Exists for tests and measurement.
+   */
+  get candidateBookingsRun(): number {
+    return this.bookingsRun;
   }
 
   /**
@@ -682,39 +1146,80 @@ export class InventorySimulation {
 
   /**
    * Forecast traffic over the cells a product covers, minus what guaranteed
-   * bookings have reserved. Days start no earlier than tomorrow, the first
-   * day a booking made now could serve. Forecasts are read as of today, so
-   * the same flight narrows and shifts as the clock moves.
+   * bookings hold. Days start no earlier than tomorrow, the first day a
+   * booking made now could serve. Forecasts are read as of today, so the same
+   * flight narrows and shifts as the clock moves.
+   *
+   * A goal product's `available` is what a goal booking could hold, the same
+   * number a booking is checked against, and `free` is the candidate's own
+   * per-cell take at that goal. A share-of-voice or auction product's is the
+   * forecast less what a dry run of the bookings in place takes; a
+   * share-of-voice product shows 0 when a booking would leave a goal short.
+   *
+   * @param forecastOf @internal Reads the forecast instead of the default, as known on today. Never memoised.
    */
-  forecast(query: ForecastQuery, nowMs: number): ForecastResult {
+  forecast(query: ForecastQuery, nowMs: number, forecastOf?: ForecastReader): ForecastResult {
     this.advanceTo(nowMs);
     const product = this.traffic.requireProduct(query.product_id);
     const { start, end } = this.flightDays(query.flight_start_ms, query.flight_end_ms);
     const cells = this.traffic.eligibleCells(product.product_id, query.targeting);
     const today = this.today(nowMs);
+    const reader = this.readerFor(today, forecastOf);
     // The days a booking confirmed now would serve.
     const { first, last } = this.servingDays({ confirmed_day: today, flight_start_day: start, flight_end_day: end }, today);
-    const forecastOf = this.forecastReader(today);
+    const goalProduct = product.delivery_type === 'guaranteed' && !product.share_of_voice;
+    const candidate = this.candidateOf(cells, first, last, end, goalProduct ? 'goal' : 'share_of_voice', product.share_of_voice ?? 0);
     let clicks = 0;
     let viewable = 0;
     let completed = 0;
     let conversions = 0;
+    let freeTotal = 0;
+    let untouched = false;
     const expectedRates = new Map<number, CellRates>();
-    const { capacity, booked, available } = this.netForecast(cells, first, last, today, undefined, (_day, cell, free) => {
+    const tally = (_day: number, cell: number, free: number) => {
       let rates = expectedRates.get(cell);
       if (!rates) expectedRates.set(cell, (rates = this.traffic.expectedRates(cell)));
       clicks += free * rates.click_rate;
       viewable += free * rates.viewability;
       completed += free * rates.completion_rate;
       conversions += free * rates.click_rate * rates.conversion_rate;
-    }, forecastOf);
+      freeTotal += free;
+    };
+    let capacity = 0;
+    let booked = 0;
+    let available = 0;
+    let refused = false;
+    if (goalProduct) {
+      const goal = this.goalAvailable(candidate, today, undefined, reader);
+      capacity = goal.gross;
+      available = goal.available;
+      booked = Math.max(0, goal.held);
+      goal.takes(available, tally);
+      untouched = goal.untouched;
+    } else {
+      refused = product.share_of_voice !== undefined && this.harmsGoals(candidate, today, reader);
+      const held = this.baseRun(today, undefined, reader).held;
+      let taken = 0;
+      for (let day = first; day < last; day++) {
+        for (const cell of cells) {
+          const value = reader.read(day, cell);
+          if (value === 0) continue;
+          const part = Math.min(value, held.get(day)?.get(cell) ?? 0);
+          capacity += value;
+          taken += part;
+          if (!refused && value > part) tally(day, cell, value - part);
+        }
+      }
+      available = refused ? 0 : Math.max(0, Math.round(capacity - taken));
+      booked = refused ? capacity : taken;
+    }
     const cpm = product.delivery_type === 'guaranteed' ? query.rate_cpm ?? product.rate_cpm : query.bid_cpm;
     const affordable = query.budget !== undefined && cpm ? Math.floor((query.budget * 1000) / cpm) : Number.POSITIVE_INFINITY;
     const impressions = Math.min(available, affordable);
-    const scale = available > 0 ? impressions / available : 0;
-    const sigma = Math.sqrt(this.forecastLogVariance(cells, first, last, today, forecastOf));
+    const scale = goalProduct && !untouched ? (freeTotal > 0 ? impressions / freeTotal : 0) : (available > 0 ? impressions / available : 0);
+    const sigma = Math.sqrt(this.forecastLogVariance(cells, first, last, today, reader.read));
     const halfWidth = Math.min(RANGE_Z * sigma, 2 * this.seed.forecast_error.log_clip);
-    const bound = (factor: number) => Math.round(Math.min(affordable, Math.max(0, capacity * factor - booked)));
+    const bound = (factor: number) => (refused ? 0 : Math.round(Math.min(affordable, Math.max(0, capacity * factor - booked))));
     return {
       product_id: product.product_id,
       currency: this.seed.currency,

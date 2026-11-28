@@ -5,4 +5,4 @@
  * results from the same engine and season are compared, and a stored market
  * from another version restarts.
  */
-export const ENGINE_VERSION = '2';
+export const ENGINE_VERSION = '3';

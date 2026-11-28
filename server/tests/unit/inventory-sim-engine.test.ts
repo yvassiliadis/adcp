@@ -28,6 +28,14 @@ const at = (iso: string) => Date.parse(iso);
 const counts = (entries: Array<[number, number]>): CellCounts => new Map(entries);
 const total = (taken: CellCounts | undefined) => [...(taken ?? new Map()).values()].reduce((sum, value) => sum + value, 0);
 
+/** The bisection stops within max(1, 0.05% of its upper end) of the largest goal that fits, so `available` can read a little low. */
+const slack = (upper: number) => Math.max(1, Math.floor(0.0005 * upper));
+/** `available` is conservative: no more than `exact`, and no further below it than the bisection tolerance for `upper`. */
+function expectWithinTolerance(available: number, exact: number, upper: number = exact) {
+  expect(available).toBeLessThanOrEqual(exact);
+  expect(available).toBeGreaterThanOrEqual(exact - slack(upper));
+}
+
 function expectEngineError(fn: () => unknown, code: string): void {
   let caught: unknown;
   try {
@@ -335,10 +343,10 @@ describe('simulation', () => {
     expect(before.available).toBe(300_000);
     sim.book({ booking_id: 'g', product_id: 'banner_guaranteed', ...flight, budget: 10_000, impression_goal: 100_000 }, now);
     const after = sim.forecast({ product_id: 'banner_guaranteed', ...flight }, now);
-    expect(after.booked).toBe(100_000);
-    expect(after.available).toBe(200_000);
+    expectWithinTolerance(after.available, 200_000, 300_000);
+    expect(after.booked).toBe(300_000 - after.available);
     const shaped = toAdcpForecast(after, { guaranteed: true, generatedAt: '2026-12-31T12:00:00.000Z', validUntil: '2027-01-01T00:00:00.000Z' });
-    expect(shaped.points[0].metrics.impressions.mid).toBe(200_000);
+    expect(shaped.points[0].metrics.impressions.mid).toBe(after.available);
     expect(shaped.method).toBe('guaranteed');
     expect(shaped.forecast_range_unit).toBe('availability');
   });
@@ -385,6 +393,19 @@ describe('simulation', () => {
       return sum;
     };
 
+    it('stops the bisection within the tolerance, so a forecast costs fewer dry runs', () => {
+      const sim = InventorySimulation.create(ADSERVER_SEASON, now);
+      const whole = sim.forecast(ros, now).available;
+      sim.book({ ...ros, booking_id: 'a', budget: 1_000_000, impression_goal: Math.floor(whole * 0.75) }, now);
+      const runs = sim.dryRuns;
+      const left = sim.forecast(ros, now).available;
+      // One base run, then two runs for the upper end and for each bracket step; the tolerance leaves about 15 steps from 12 million.
+      expect(sim.dryRuns - runs).toBeLessThanOrEqual(1 + 2 * (1 + 15));
+      expectWithinTolerance(left, 2_768_997, whole);
+      sim.book({ ...ros, booking_id: 'b', budget: 1_000_000, impression_goal: left }, now);
+      expectEngineError(() => sim.book({ ...ros, booking_id: 'c', budget: 1_000_000, impression_goal: slack(whole) + 1 + (sim.forecast(ros, now).available) }, now), 'INSUFFICIENT_INVENTORY');
+    });
+
     it('refuses a second 75% goal once the first holds the forecast', () => {
       const sim = InventorySimulation.create(ADSERVER_SEASON, now);
       const { calendar } = sim.traffic;
@@ -394,10 +415,11 @@ describe('simulation', () => {
       expect(available).toBe(Math.round(capacity));
       const share = Math.floor(available * 0.75);
       sim.book({ ...ros, booking_id: 'a', budget: 1_000_000, impression_goal: share }, now);
-      // The first goal holds `share` of the forecast, an integer, so what is left is `available` less `share`.
+      // The first goal paces to expected traffic and takes more than its forecast share on the days the forecast runs
+      // below expected, so the second is offered less than `available` less `share` (3,035,386).
       const left = sim.forecast(ros, now).available;
-      expect(Math.abs(left - (available - share))).toBeLessThanOrEqual(1);
-      expect(left).toBeLessThan(share);
+      expectWithinTolerance(left, 2_768_997, available);
+      expect(left).toBeLessThan(available - share);
       let caught: unknown;
       try {
         sim.book({ ...ros, booking_id: 'b', budget: 1_000_000, impression_goal: share }, now);
@@ -411,12 +433,15 @@ describe('simulation', () => {
       expect(() => sim.booking('b')).toThrow();
     });
 
-    it('accepts a goal that exactly fits what is left', () => {
+    it('accepts a goal that fits what is left, within the check\'s tolerance', () => {
       const sim = InventorySimulation.create(scarceSeed(), now);
       sim.book(goal('a', 100_000), now);
-      sim.book(goal('b', 200_000), now);
-      expect(sim.forecast({ product_id: 'banner_guaranteed', ...flight }, now).available).toBe(0);
-      expectEngineError(() => sim.book(goal('c', 1), now), 'INSUFFICIENT_INVENTORY');
+      const room = sim.forecast({ product_id: 'banner_guaranteed', ...flight }, now).available;
+      expectWithinTolerance(room, 200_000, 300_000);
+      sim.book(goal('b', room), now);
+      const rest = sim.forecast({ product_id: 'banner_guaranteed', ...flight }, now).available;
+      expect(rest).toBeLessThanOrEqual(slack(300_000));
+      expectEngineError(() => sim.book(goal('c', rest + slack(300_000) + 1), now), 'INSUFFICIENT_INVENTORY');
     });
 
     it('refuses a goal one impression over what is left', () => {
@@ -440,8 +465,10 @@ describe('simulation', () => {
       sim.book(goal('b', 100_000), now);
       expectEngineError(() => sim.update('a', { impression_goal: 200_001 }, now), 'INSUFFICIENT_INVENTORY');
       expect(sim.booking('a').impression_goal).toBe(100_000);
-      sim.update('a', { impression_goal: 200_000 }, now);
-      expect(sim.booking('a').impression_goal).toBe(200_000);
+      const room = sim.bookingAvailable('a', now);
+      expectWithinTolerance(room, 200_000, 300_000);
+      sim.update('a', { impression_goal: room }, now);
+      expect(sim.booking('a').impression_goal).toBe(room);
     });
 
     it('leaves the whole patch unapplied when the raised goal is refused', () => {
@@ -531,15 +558,18 @@ describe('simulation', () => {
         // against B's new 150k.
         sim.update('B', { impression_goal: 150_000 }, now);
         sim.update('A', { impression_goal: 450_000 }, now);
-        // The final state is what decides, so the batch fails whatever its order.
-        expectEngineError(() => sim.requireGoalAvailable('B', now), 'INSUFFICIENT_INVENTORY');
         sim.requireGoalAvailable('A', now);
+        sim.requireGoalAvailable('B', now);
+        // 450,001 is one more than the broad product can hold beside B's 150k.
+        expectEngineError(() => sim.update('A', { impression_goal: 450_001 }, now), 'INSUFFICIENT_INVENTORY');
+        expect(sim.booking('A').impression_goal).toBe(450_000);
 
         const other = InventorySimulation.create(overlapSeed(), now);
         book(other, 'A', 'broad', 300_000);
         book(other, 'B', 'narrow', 100_000);
         other.update('A', { impression_goal: 450_000 }, now);
-        expectEngineError(() => other.update('B', { impression_goal: 150_000 }, now), 'INSUFFICIENT_INVENTORY');
+        other.update('B', { impression_goal: 150_000 }, now);
+        expectEngineError(() => other.update('B', { impression_goal: 150_001 }, now), 'INSUFFICIENT_INVENTORY');
       });
 
       it('has nothing to check on a booking without a goal', () => {
@@ -567,7 +597,19 @@ describe('simulation', () => {
       expect(mid.capacity).toBeLessThan(whole.capacity);
       expect(mid.booked).toBeGreaterThan(0);
       expect(mid.available).toBeGreaterThan(0);
-      expect(Math.abs(mid.booked - (share * mid.capacity) / whole.capacity)).toBeLessThanOrEqual(1);
+      // The booking paces to expected traffic, so the window holds its share of the expected traffic that falls inside it.
+      const { calendar } = sim.traffic;
+      const cells = sim.traffic.eligibleCells(ros.product_id);
+      const expectedSum = (first: number, last: number) => {
+        let sum = 0;
+        for (let day = first; day < last; day++) for (const cell of cells) sum += sim.traffic.day(day).expected.get(cell) ?? 0;
+        return sum;
+      };
+      const flightDays = [calendar.dayOf(ros.flight_start_ms), calendar.dayOf(ros.flight_end_ms)] as const;
+      const midDay = calendar.dayOf(at('2027-02-15T00:00:00Z'));
+      const inWindow = (share * expectedSum(midDay, flightDays[1])) / expectedSum(...flightDays);
+      expect(mid.booked).toBeGreaterThanOrEqual(Math.round(inWindow) - 1);
+      expect(mid.booked - inWindow).toBeLessThanOrEqual(slack(mid.capacity) + 1);
     });
   });
 
@@ -601,13 +643,16 @@ describe('simulation', () => {
         expect(sim.booking('a').delivered.impressions).toBeLessThanOrEqual(available);
       });
 
-      it(`sells the second booking exactly what the first leaves, starting on a ${name}`, () => {
+      it(`sells the second booking what the first leaves, starting on a ${name}`, () => {
         const sim = InventorySimulation.create(EXACT, bookedAt);
         const whole = sim.forecast(flightFrom(iso), bookedAt).available;
         const a = Math.floor(whole * 0.75);
         sim.book({ ...flightFrom(iso), booking_id: 'a', budget: 10_000_000, impression_goal: a }, bookedAt);
         const available = sim.forecast(flightFrom(iso), bookedAt).available;
-        expect(Math.abs(available - (whole - a))).toBeLessThanOrEqual(2);
+        // Forecast sums are unrounded while pacing and delivery use the rounded table, so the subtraction is off by a
+        // few hundred impressions on top of the bisection tolerance.
+        expect(available).toBeLessThanOrEqual(whole - a);
+        expect(available).toBeGreaterThanOrEqual(whole - a - slack(whole) - 250);
         sim.book({ ...flightFrom(iso), booking_id: 'b', budget: 10_000_000, impression_goal: available }, bookedAt);
         runThrough(sim, iso);
         expect(sim.booking('a').delivered.impressions).toBeGreaterThanOrEqual(a - 30);
@@ -1622,18 +1667,20 @@ describe('published range', () => {
       const affordable = 250_000;
       expect(Math.abs(result.available + result.booked - result.capacity)).toBeLessThanOrEqual(1);
       // The booking spreads what is left of its goal over its own serving days, [asOf, 31) because day
-      // `asOf` has not run yet, in proportion to the forecast as known on `asOf`. A forecast starts
-      // tomorrow, so it holds the days [asOf + 1, 31): the share of the days in that window.
+      // `asOf` has not run yet, in proportion to expected traffic. A forecast starts tomorrow, so the
+      // booking holds at least its share of the days [asOf + 1, 31); what the forecast adds beyond it
+      // is the pacing slack a later booking cannot recover, since the plan never delivers early.
       const left = 100_000 - sim.booking('g').delivered.impressions;
       let serving = 0;
       let inside = 0;
       for (let day = Math.max(asOf, 1); day < 31; day++) {
-        const value = sim.traffic.forecastValue(day, 0, asOf);
+        const value = sim.traffic.day(day).expected.get(0) ?? 0;
         serving += value;
         if (day > asOf) inside += value;
       }
       expect(left).toBeLessThan(serving);
-      expect(Math.abs(result.booked - (left * inside) / serving)).toBeLessThanOrEqual(1);
+      expect(result.booked).toBeGreaterThanOrEqual(Math.round((left * inside) / serving) - 1);
+      expect(result.booked).toBeLessThan(result.capacity);
       expect(result.low).toBeLessThanOrEqual(result.impressions);
       expect(result.impressions).toBeLessThanOrEqual(result.high);
       expect(result.high).toBeLessThanOrEqual(affordable);
@@ -1852,7 +1899,7 @@ describe('engine version', () => {
 
   it('pins the engine outputs to the engine version', () => {
     // A change that moves either hash must bump ENGINE_VERSION and update all three literals.
-    expect(ENGINE_VERSION).toBe('2');
+    expect(ENGINE_VERSION).toBe('3');
     const adserver = outputHash(
       ADSERVER_SEASON,
       ADSERVER_SEASON.products.map(product => product.product_id),
@@ -1869,7 +1916,488 @@ describe('engine version', () => {
         { id: 'b', product: 'weekly_dispatch_sponsor', budget: 15_000 },
       ],
     );
-    expect(adserver).toBe('7aeb9a70a5cfba64cb83ec4cf5df95d6de2081f8dc2e7ca41fce119b3538a243');
+    expect(adserver).toBe('8f4dc416a63be962bb18e34904606a3701d45256826365deeb08ae34551c5bdd');
     expect(content).toBe('8159d846249783f49037f8b1e623f8366cea273ec47d1a61c68cc01f51105331');
+  });
+});
+
+describe('goal availability from a dry run of delivery', () => {
+  const now = at('2026-12-31T12:00:00Z');
+  const january = { flight_start_ms: at('2027-01-01T00:00:00Z'), flight_end_ms: at('2027-01-31T00:00:00Z') };
+  const february = { flight_start_ms: at('2027-02-01T00:00:00Z'), flight_end_ms: at('2027-03-01T00:00:00Z') };
+  type Window = { flight_start_ms: number; flight_end_ms: number };
+
+  /** The scarce market with a segment-one banner (60% of the cells) and a
+   * half-share takeover beside the run-of-site banner. */
+  function layeredSeed(): SeasonSeed {
+    const base = scarceSeed();
+    return scarceSeed({
+      products: [
+        ...base.products,
+        { product_id: 'banner_s1', name: 'Segment one banner', description: 'Guaranteed banner to segment one', delivery_type: 'guaranteed', placement_ids: ['banner'], segment_id: 's1', rate_cpm: 10 },
+        { product_id: 'banner_takeover', name: 'Banner takeover', description: 'Half the banner impressions', delivery_type: 'guaranteed', placement_ids: ['banner'], rate_cpm: 10, share_of_voice: 0.5 },
+      ],
+    });
+  }
+  const layered = () => InventorySimulation.create(layeredSeed(), now);
+  const book = (sim: InventorySimulation, booking_id: string, product_id: string, impression_goal: number, window: Window = january) =>
+    sim.book({ booking_id, product_id, ...window, budget: 100_000, impression_goal }, now);
+  const availableOn = (sim: InventorySimulation, product_id: string, window: Window = january, targeting?: { segment_ids: string[] }) =>
+    sim.forecast({ product_id, ...window, ...(targeting && { targeting }) }, now).available;
+
+  it('accepts a narrow goal beside a broad one that leaves it room (1)', () => {
+    const sim = layered();
+    book(sim, 'ros', 'banner_guaranteed', 120_000);
+    expect(availableOn(sim, 'banner_s1')).toBe(180_000);
+    book(sim, 's1', 'banner_s1', 180_000);
+    expectEngineError(() => book(sim, 'more', 'banner_s1', 1), 'INSUFFICIENT_INVENTORY');
+  });
+
+  it('refuses a broad goal that overbooks the narrow goal it shares cells with (2)', () => {
+    const sim = layered();
+    book(sim, 's1', 'banner_s1', 180_000);
+    expectEngineError(() => book(sim, 'ros', 'banner_guaranteed', 150_000), 'INSUFFICIENT_INVENTORY');
+    const room = availableOn(sim, 'banner_guaranteed');
+    expectWithinTolerance(room, 120_000, 300_000);
+    book(sim, 'ros', 'banner_guaranteed', room);
+    const other = layered();
+    book(other, 's1', 'banner_s1', 180_000);
+    expectEngineError(() => book(other, 'ros', 'banner_guaranteed', 120_001), 'INSUFFICIENT_INVENTORY');
+  });
+
+  it('shows no phantom inventory in either booking order (3)', () => {
+    for (const order of [['ros', 's1'], ['s1', 'ros']]) {
+      const sim = layered();
+      for (const id of order) {
+        if (id === 'ros') book(sim, 'ros', 'banner_guaranteed', order[0] === 'ros' ? 120_000 : availableOn(sim, 'banner_guaranteed'));
+        else book(sim, 's1', 'banner_s1', order[0] === 's1' ? 180_000 : availableOn(sim, 'banner_s1'));
+      }
+      for (const product of ['banner_guaranteed', 'banner_s1', 'banner_takeover', 'banner_auction']) {
+        expect(availableOn(sim, product), `${order.join(' then ')}: ${product}`).toBeLessThanOrEqual(slack(300_000));
+      }
+    }
+  });
+
+  it('weighs a flight that starts mid-way through an existing booking (4)', () => {
+    const sim = layered();
+    book(sim, 'ros', 'banner_guaranteed', 225_000);
+    const later = { flight_start_ms: at('2027-01-16T00:00:00Z'), flight_end_ms: january.flight_end_ms };
+    const available = availableOn(sim, 'banner_s1', later);
+    // The run-of-site goal paces with expected traffic, 7,500 a day here, so
+    // the segment gets the other 2,500 a day of the 10,000 for the 15 days
+    // from the 16th: 37,500.
+    expectWithinTolerance(available, 37_500, 90_000);
+    expectEngineError(() => book(sim, 's1', 'banner_s1', available + slack(90_000) + 1, later), 'INSUFFICIENT_INVENTORY');
+    book(sim, 's1', 'banner_s1', available, later);
+  });
+
+  it('holds a segment goal at its forecast against a partly overlapping segment (5)', () => {
+    const sim = InventorySimulation.create(ADSERVER_SEASON, now);
+    const product_id = 'ros_display_guaranteed';
+    const households = { segment_ids: ['household_decision_makers'] };
+    const news = { segment_ids: ['news_loyalists'] };
+    const goal = availableOn(sim, product_id, february, households);
+    sim.book({ booking_id: 'hh', product_id, targeting: households, ...february, budget: 1_000_000, impression_goal: goal }, now);
+    const capacity = sim.forecast({ product_id, ...february, targeting: news }, now).capacity;
+    expect(availableOn(sim, product_id, february, news)).toBeLessThanOrEqual(capacity * 0.0001);
+  });
+
+  it('accepts a raise to exactly its available and refuses one more (6)', () => {
+    const sim = InventorySimulation.create(scarceSeed(), now);
+    book(sim, 'a', 'banner_guaranteed', 100_000);
+    book(sim, 'b', 'banner_guaranteed', 100_000);
+    const available = sim.bookingAvailable('a', now);
+    expect(available).toBeGreaterThan(190_000);
+    expect(available).toBeLessThanOrEqual(200_000);
+    expectEngineError(() => sim.update('a', { impression_goal: available + 1 }, now), 'INSUFFICIENT_INVENTORY');
+    expect(sim.booking('a').impression_goal).toBe(100_000);
+    sim.update('a', { impression_goal: available }, now);
+    expect(sim.booking('a').impression_goal).toBe(available);
+  });
+
+  it('books exactly the forecast available on every guaranteed ad server product and refuses one more (7)', () => {
+    const populated = () => {
+      const sim = InventorySimulation.create(ADSERVER_SEASON, now);
+      sim.book({ booking_id: 'ros', product_id: 'ros_display_guaranteed', ...february, budget: 1_000_000, impression_goal: 4_000_000 }, now);
+      sim.book({ booking_id: 'fans', product_id: 'sports_fans_display_guaranteed', ...february, budget: 1_000_000, impression_goal: 1_500_000 }, now);
+      sim.book({ booking_id: 'hero', product_id: 'sports_hero_guaranteed', ...february, budget: 100_000, impression_goal: 100_000 }, now);
+      sim.book({ booking_id: 'pre', product_id: 'preroll_guaranteed', ...february, budget: 100_000, impression_goal: 400_000 }, now);
+      return sim;
+    };
+    for (const product_id of ['ros_display_guaranteed', 'sports_fans_display_guaranteed', 'sports_hero_guaranteed', 'preroll_guaranteed']) {
+      const available = availableOn(populated(), product_id, february);
+      expect(available, product_id).toBeGreaterThan(0);
+      populated().book({ booking_id: 'x', product_id, ...february, budget: 1_000_000, impression_goal: available }, now);
+      expectEngineError(
+        () => populated().book({ booking_id: 'x', product_id, ...february, budget: 1_000_000, impression_goal: available + 1 }, now),
+        'INSUFFICIENT_INVENTORY');
+    }
+  });
+
+  describe('share-of-voice on goal-held cells (8)', () => {
+    const takeover = (sim: InventorySimulation) =>
+      sim.book({ booking_id: 'takeover', product_id: 'banner_takeover', ...january, budget: 100_000 }, now);
+
+    it('is refused when it would starve a goal, and the forecast shows 0', () => {
+      const sim = layered();
+      // 200,000 is 6,667 a day; half the banner leaves 5,000.
+      book(sim, 'ros', 'banner_guaranteed', 200_000);
+      expect(availableOn(sim, 'banner_takeover')).toBe(0);
+      const refused = sim.forecast({ product_id: 'banner_takeover', ...january }, now);
+      expect([refused.low, refused.available, refused.high]).toEqual([0, 0, 0]);
+      expectEngineError(() => takeover(sim), 'INSUFFICIENT_INVENTORY');
+      expect(() => sim.booking('takeover')).toThrow();
+    });
+
+    it('is accepted when the goal still fits, and the forecast shows what is left', () => {
+      const sim = layered();
+      book(sim, 'ros', 'banner_guaranteed', 100_000);
+      const forecast = sim.forecast({ product_id: 'banner_takeover', ...january }, now);
+      expect(forecast.available).toBeGreaterThan(0);
+      takeover(sim);
+      expect(sim.booking('takeover').kind).toBe('share_of_voice');
+      // The goal now fits only within the half the takeover leaves.
+      expectWithinTolerance(availableOn(sim, 'banner_guaranteed'), 50_000, 150_000);
+    });
+
+    it('offers a goal exactly what it books beside a takeover, and refuses one more', () => {
+      const sim = layered();
+      takeover(sim);
+      const available = availableOn(sim, 'banner_guaranteed');
+      expect(available).toBe(150_000);
+      expectEngineError(() => book(sim, 'over', 'banner_guaranteed', available + 1), 'INSUFFICIENT_INVENTORY');
+      book(sim, 'ros', 'banner_guaranteed', available);
+      sim.requireGoalAvailable('ros', now);
+    });
+
+    it('still refuses a share that is sold already before weighing guarantees', () => {
+      const sim = layered();
+      takeover(sim);
+      sim.book({ booking_id: 'second', product_id: 'banner_takeover', ...january, budget: 100_000 }, now);
+      expectEngineError(() => sim.book({ booking_id: 'third', product_id: 'banner_takeover', ...january, budget: 100_000 }, now), 'SOLD_OUT');
+    });
+  });
+
+  describe('a shortened or extended end (9)', () => {
+    const endAt = (iso: string) => ({ flight_end_ms: at(iso) });
+
+    it('refuses an end the goal cannot fit and leaves the booking unchanged', () => {
+      const sim = layered();
+      book(sim, 'a', 'banner_guaranteed', 150_000);
+      expectEngineError(() => sim.update('a', endAt('2027-01-11T00:00:00Z'), now), 'INSUFFICIENT_INVENTORY');
+      expect(sim.booking('a').flight_end_day).toBe(30);
+      sim.update('a', endAt('2027-01-16T00:00:00Z'), now);
+      expect(sim.booking('a').flight_end_day).toBe(15);
+    });
+
+    it('accepts an end the goal fits, whatever the pace it set before', () => {
+      const sim = layered();
+      book(sim, 'a', 'banner_guaranteed', 90_000);
+      sim.update('a', endAt('2027-01-11T00:00:00Z'), now);
+      expect(sim.booking('a').flight_end_day).toBe(10);
+    });
+
+    it('refuses an extension that starves another goal', () => {
+      const sim = layered();
+      book(sim, 'a', 'banner_guaranteed', 150_000, { flight_start_ms: january.flight_start_ms, flight_end_ms: at('2027-01-16T00:00:00Z') });
+      book(sim, 'b', 'banner_guaranteed', 150_000, { flight_start_ms: at('2027-01-16T00:00:00Z'), flight_end_ms: january.flight_end_ms });
+      expectEngineError(() => sim.update('a', endAt('2027-01-31T00:00:00Z'), now), 'INSUFFICIENT_INVENTORY');
+      expect(sim.booking('a').flight_end_day).toBe(15);
+    });
+
+    it('refuses an end today while the goal is unmet, and accepts it once the goal is met', () => {
+      const sim = layered();
+      book(sim, 'a', 'banner_guaranteed', 100_000);
+      const later = at('2027-01-11T12:00:00Z');
+      sim.advanceTo(later);
+      expectEngineError(() => sim.update('a', endAt('2027-01-11T00:00:00Z'), later), 'INSUFFICIENT_INVENTORY');
+      expect(sim.booking('a').flight_end_day).toBe(30);
+      sim.update('a', { impression_goal: 1_000 }, later);
+      sim.update('a', endAt('2027-01-11T00:00:00Z'), later);
+      expect(sim.booking('a').flight_end_day).toBe(10);
+    });
+  });
+
+  describe('a share-of-voice end moved later (10)', () => {
+    const endAt = (iso: string) => ({ flight_end_ms: at(iso) });
+    const firstHalf = { flight_start_ms: january.flight_start_ms, flight_end_ms: at('2027-01-16T00:00:00Z') };
+    const secondHalf = { flight_start_ms: at('2027-01-16T00:00:00Z'), flight_end_ms: january.flight_end_ms };
+    const takeover = (sim: InventorySimulation, booking_id: string, window: Window) =>
+      sim.book({ booking_id, product_id: 'banner_takeover', ...window, budget: 100_000 }, now);
+    /** What a refusal must leave alone: every booking, and what a new goal could still book. */
+    const stateOf = (sim: InventorySimulation) => JSON.stringify({
+      bookings: sim.state.bookings,
+      room: availableOn(sim, 'banner_guaranteed', secondHalf),
+    });
+
+    it('refuses an extension into days another share-of-voice booking has sold, and changes nothing', () => {
+      const sim = layered();
+      takeover(sim, 'a', firstHalf);
+      takeover(sim, 'b', secondHalf);
+      takeover(sim, 'c', secondHalf);
+      const before = stateOf(sim);
+      expectEngineError(() => sim.update('a', endAt('2027-01-31T00:00:00Z'), now), 'SOLD_OUT');
+      expect(sim.booking('a').flight_end_day).toBe(15);
+      expect(stateOf(sim)).toBe(before);
+      expectEngineError(() => sim.update('a', { ...endAt('2027-01-31T00:00:00Z'), budget: 1 }, now), 'SOLD_OUT');
+      expect(stateOf(sim)).toBe(before);
+      // A paused booking still holds its share, as in book(); a canceled one frees it.
+      sim.update('c', { status: 'paused' }, now);
+      expectEngineError(() => sim.update('a', endAt('2027-01-31T00:00:00Z'), now), 'SOLD_OUT');
+      expect(sim.booking('a').flight_end_day).toBe(15);
+      sim.update('c', { status: 'canceled' }, now);
+      sim.update('a', endAt('2027-01-31T00:00:00Z'), now);
+      expect(sim.booking('a').flight_end_day).toBe(30);
+    });
+
+    it('counts only the days an extension adds, so a share sold for the old days does not block it', () => {
+      const sim = layered();
+      takeover(sim, 'a', firstHalf);
+      takeover(sim, 'b', firstHalf);
+      sim.update('a', endAt('2027-01-31T00:00:00Z'), now);
+      expect(sim.booking('a').flight_end_day).toBe(30);
+    });
+
+    describe('a booking that has already ended', () => {
+      const later = at('2027-01-20T12:00:00Z');
+      const ended = { flight_start_ms: january.flight_start_ms, flight_end_ms: at('2027-01-11T00:00:00Z') };
+      const past = { flight_start_ms: at('2027-01-11T00:00:00Z'), flight_end_ms: at('2027-01-16T00:00:00Z') };
+      const setup = () => {
+        const sim = layered();
+        takeover(sim, 'a', ended);
+        takeover(sim, 'b', past);
+        takeover(sim, 'c', past);
+        return sim;
+      };
+
+      it('does not count days before today as sold, so other bookings on those days cannot refuse the extension', () => {
+        const sim = setup();
+        sim.advanceTo(later);
+        expect(sim.booking('a').flight_end_day).toBe(10);
+        sim.update('a', endAt('2027-01-31T00:00:00Z'), later);
+        expect(sim.booking('a').flight_end_day).toBe(30);
+      });
+
+      it('still weighs the future added days against a guaranteed goal', () => {
+        const sim = setup();
+        // 80,000 over the last 10 days is 8,000 a day; the takeover would leave 5,000.
+        book(sim, 'goal', 'banner_guaranteed', 80_000, { flight_start_ms: at('2027-01-21T00:00:00Z'), flight_end_ms: january.flight_end_ms });
+        sim.advanceTo(later);
+        expectEngineError(() => sim.update('a', endAt('2027-01-31T00:00:00Z'), later), 'INSUFFICIENT_INVENTORY');
+        expect(sim.booking('a').flight_end_day).toBe(10);
+      });
+    });
+
+    it('refuses an extension into days a guaranteed goal needs, and changes nothing', () => {
+      const sim = layered();
+      takeover(sim, 'a', firstHalf);
+      // 100,000 over the second half is 6,667 a day; the takeover would leave 5,000.
+      book(sim, 'goal', 'banner_guaranteed', 100_000, secondHalf);
+      const before = stateOf(sim);
+      expectEngineError(() => sim.update('a', endAt('2027-01-31T00:00:00Z'), now), 'INSUFFICIENT_INVENTORY');
+      expect(sim.booking('a').flight_end_day).toBe(15);
+      expect(stateOf(sim)).toBe(before);
+      sim.requireGoalAvailable('goal', now);
+    });
+
+    it('accepts an extension that leaves the goal what it needs', () => {
+      const sim = layered();
+      takeover(sim, 'a', firstHalf);
+      book(sim, 'goal', 'banner_guaranteed', 50_000, secondHalf);
+      sim.update('a', endAt('2027-01-31T00:00:00Z'), now);
+      expect(sim.booking('a').flight_end_day).toBe(30);
+      sim.requireGoalAvailable('goal', now);
+    });
+
+    it('weighs only the days still to run when the booking is part-way through', () => {
+      const later = at('2027-01-20T12:00:00Z');
+      const run = (goal: number) => {
+        const sim = layered();
+        takeover(sim, 'a', firstHalf);
+        book(sim, 'goal', 'banner_guaranteed', goal, secondHalf);
+        sim.advanceTo(later);
+        return sim;
+      };
+      // About 73,000 of the 100,000 is still owed over 11 days, and half the banner leaves 5,000 a day.
+      const owed = run(100_000);
+      expectEngineError(() => owed.update('a', endAt('2027-01-31T00:00:00Z'), later), 'INSUFFICIENT_INVENTORY');
+      expect(owed.booking('a').flight_end_day).toBe(15);
+      const fits = run(50_000);
+      fits.update('a', endAt('2027-01-31T00:00:00Z'), later);
+      expect(fits.booking('a').flight_end_day).toBe(30);
+    });
+
+    it('accepts a shortening whatever else is booked', () => {
+      const sim = layered();
+      takeover(sim, 'a', january);
+      // 50,000 over the second half fits beside the takeover's half.
+      book(sim, 'goal', 'banner_guaranteed', 50_000, secondHalf);
+      sim.update('a', endAt('2027-01-16T00:00:00Z'), now);
+      expect(sim.booking('a').flight_end_day).toBe(15);
+      sim.requireGoalAvailable('goal', now);
+    });
+  });
+
+  describe('the forecast reader and the memo', () => {
+    /** The forecast the default reader serves, as a reader the engine never memoises. */
+    const asKnownToday = (sim: InventorySimulation, nowMs = now) => (day: number, cell: number) => sim.traffic.forecastValue(day, cell, sim.today(nowMs));
+    /** Dry runs one forecast costs. */
+    const cost = (sim: InventorySimulation, forecastOf?: (day: number, cell: number) => number, at = now) => {
+      const before = sim.dryRuns;
+      sim.forecast({ product_id: 'banner_s1', ...january }, at, forecastOf);
+      return sim.dryRuns - before;
+    };
+    const seeded = () => {
+      const sim = layered();
+      book(sim, 'ros', 'banner_guaranteed', 120_000);
+      return sim;
+    };
+
+    it('memoises the base run for the default reader, never for one it is given', () => {
+      const sim = seeded();
+      const first = cost(sim);
+      expect(first).toBeGreaterThan(1);
+      expect(cost(sim)).toBeLessThan(first);
+
+      const given = seeded();
+      const cold = cost(given, asKnownToday(given));
+      expect(cold).toBe(first);
+      expect(cost(given, asKnownToday(given))).toBe(cold);
+    });
+
+    it('gives the same forecast memoised, unmemoised, and from a reader it is given', () => {
+      const sim = seeded();
+      const query = { product_id: 'banner_s1', ...january };
+      const cold = sim.forecast(query, now);
+      const warm = sim.forecast(query, now);
+      expect(warm).toEqual(cold);
+      expect(sim.forecast(query, now, asKnownToday(sim))).toEqual(cold);
+      for (const product_id of ['banner_guaranteed', 'banner_takeover', 'banner_auction']) {
+        expect(sim.forecast({ product_id, ...january, bid_cpm: 3 }, now, asKnownToday(sim))).toEqual(sim.forecast({ product_id, ...january, bid_cpm: 3 }, now));
+      }
+    });
+
+    it('does not carry one product\'s pacing over to the next it forecasts', () => {
+      const sim = seeded();
+      sim.forecast({ product_id: 'banner_guaranteed', ...january }, now);
+      const fresh = seeded();
+      for (const product_id of ['banner_s1', 'banner_guaranteed']) {
+        expect(sim.forecast({ product_id, ...january }, now)).toEqual(fresh.forecast({ product_id, ...january }, now));
+      }
+    });
+
+    it('drops the memo when the clock moves a day', () => {
+      const sim = seeded();
+      cost(sim);
+      const warm = cost(sim);
+      expect(cost(sim)).toBe(warm);
+      const tomorrow = now + 86_400_000;
+      const recomputed = cost(sim, undefined, tomorrow);
+      expect(recomputed).toBeGreaterThan(warm);
+      expect(cost(sim, undefined, tomorrow)).toBe(warm);
+    });
+
+    it('weighs a product only against the bookings it shares cells and days with', () => {
+      const base = scarceSeed();
+      const seed = scarceSeed({
+        placements: [...base.placements, { ...base.placements[0], placement_id: 'video', name: 'Video' }],
+        products: [
+          ...base.products,
+          { product_id: 'video_guaranteed', name: 'Video', description: 'Guaranteed video', delivery_type: 'guaranteed', placement_ids: ['video'], rate_cpm: 10 },
+        ],
+      });
+      const sim = InventorySimulation.create(seed, now);
+      sim.book({ booking_id: 'v1', product_id: 'video_guaranteed', ...january, budget: 100_000, impression_goal: 120_000 }, now);
+      sim.book({ booking_id: 'v2', product_id: 'video_guaranteed', ...january, budget: 100_000, impression_goal: 60_000 }, now);
+      sim.book({ booking_id: 'b1', product_id: 'banner_guaranteed', ...january, budget: 100_000, impression_goal: 90_000 }, now);
+      const probe = () => {
+        const runs = sim.dryRuns;
+        const simulated = sim.candidateBookingsRun;
+        const forecast = sim.forecast({ product_id: 'video_guaranteed', ...january }, now);
+        return { available: forecast.available, runs: sim.dryRuns - runs, simulated: sim.candidateBookingsRun - simulated };
+      };
+      const before = probe();
+      sim.book({ booking_id: 'b2', product_id: 'banner_guaranteed', ...january, budget: 100_000, impression_goal: 90_000 }, now);
+      sim.update('b1', { impression_goal: 100_000 }, now);
+      expect(probe()).toEqual(before);
+      expect(sim.forecast({ product_id: 'banner_guaranteed', ...january }, now).available).toBeLessThan(110_000);
+    });
+
+    it('reads the forecast it is given', () => {
+      const sim = seeded();
+      const known = asKnownToday(sim);
+      const half = (day: number, cell: number) => known(day, cell) / 2;
+      const whole = sim.forecast({ product_id: 'banner_s1', ...january }, now);
+      const halved = sim.forecast({ product_id: 'banner_s1', ...january }, now, half);
+      expect(halved.capacity).toBeLessThan(whole.capacity);
+      expect(halved.available).toBeLessThan(whole.available);
+    });
+
+    it('paces to expected traffic whatever forecast it reads', () => {
+      const sim = layered();
+      const known = asKnownToday(sim);
+      const query = { product_id: 'banner_guaranteed', ...january };
+      const scaled = (day: number, cell: number) => 2 * known(day, cell);
+      // Supply doubles, pacing does not: a lone goal over the forecast it reads is offered all of it.
+      expect(sim.forecast(query, now, scaled).available).toBe(Math.round(2 * sim.forecast(query, now).capacity));
+    });
+
+    it('drops the memo when a booking is made, changed, or refused a change', () => {
+      const sim = seeded();
+      const stale = (change: () => void) => {
+        cost(sim);
+        cost(sim);
+        change();
+        const afterChange = cost(sim);
+        expect(afterChange).toBeGreaterThan(cost(sim));
+      };
+      stale(() => { sim.book({ booking_id: 'more', product_id: 'banner_guaranteed', ...january, budget: 100_000, impression_goal: 10_000 }, now); });
+      stale(() => { sim.update('more', { impression_goal: 20_000 }, now); });
+      stale(() => expectEngineError(() => sim.update('more', { impression_goal: 5_000_000 }, now), 'INSUFFICIENT_INVENTORY'));
+    });
+
+    it('writes nothing to the state or the traffic tables', () => {
+      const sim = seeded();
+      const tables = () => JSON.stringify(Array.from({ length: sim.traffic.calendar.days }, (_, day) => {
+        const { expected, actual } = sim.traffic.day(day);
+        return [[...expected], [...actual]];
+      }));
+      const before = { state: JSON.stringify(sim.state), tables: tables() };
+      sim.forecast({ product_id: 'banner_s1', ...january }, now);
+      sim.forecast({ product_id: 'banner_takeover', ...january }, now);
+      sim.bookingAvailable('ros', now);
+      sim.requireGoalAvailable('ros', now);
+      expectEngineError(() => book(sim, 'over', 'banner_guaranteed', 5_000_000), 'INSUFFICIENT_INVENTORY');
+      expect({ state: JSON.stringify(sim.state), tables: tables() }).toEqual(before);
+    });
+  });
+
+  it('leaves share-of-voice and auction forecasts as they were with no bookings (10)', () => {
+    const sim = InventorySimulation.create(ADSERVER_SEASON, now);
+    const shape = (product_id: string, extra = {}) => {
+      const { available, booked, capacity, clicks, conversions, impressions } = sim.forecast({ product_id, ...february, ...extra }, now);
+      return { available, booked, capacity, clicks, conversions, impressions };
+    };
+    expect(shape('homepage_takeover_daily')).toEqual({ available: 1_643_609, booked: 0, capacity: 1_643_609, clicks: 6_870, conversions: 208, impressions: 1_643_609 });
+    expect(shape('ros_display_auction', { bid_cpm: 3 })).toEqual({ available: 12_141_542, booked: 0, capacity: 12_141_542, clicks: 17_340, conversions: 351, impressions: 12_141_542 });
+    expect(shape('preroll_auction', { bid_cpm: 3 })).toEqual({ available: 1_798_747, booked: 0, capacity: 1_798_747, clicks: 3_759, conversions: 76, impressions: 1_798_747 });
+  });
+
+  it('does not refuse a goal for what its budget buys (11)', () => {
+    const sim = InventorySimulation.create(scarceSeed(), now);
+    sim.book({ booking_id: 'a', product_id: 'banner_guaranteed', ...january, budget: 1, impression_goal: 100_000 }, now);
+    sim.book({ booking_id: 'b', product_id: 'banner_guaranteed', ...january, budget: 1, impression_goal: 150_000 }, now);
+    expect(sim.booking('b').impression_goal).toBe(150_000);
+  });
+
+  it('reports capacity as available on an empty market (12)', () => {
+    const sim = InventorySimulation.create(ADSERVER_SEASON, now);
+    for (const product_id of ['ros_display_guaranteed', 'sports_fans_display_guaranteed', 'sports_hero_guaranteed', 'preroll_guaranteed']) {
+      const forecast = sim.forecast({ product_id, ...february }, now);
+      expect(forecast.available, product_id).toBe(forecast.capacity);
+      expect(forecast.booked).toBe(0);
+    }
+    const scarce = InventorySimulation.create(scarceSeed(), now);
+    expect(availableOn(scarce, 'banner_guaranteed')).toBe(300_000);
   });
 });

@@ -758,18 +758,27 @@ export class InventoryPlatform implements DecisioningPlatform<{ strict: boolean 
           apply(pkg, { status: 'canceled' }, 'canceled');
         }
       } else {
+        // Raised goals and flight-end changes go in after every other change, so
+        // each is weighed against what the whole request leaves, whatever its
+        // package order. A package's raise and end change land as one update.
+        const deferred = new Map<string, { pkg: PackageRecord; impressions?: number; endMs?: number; impressionsField?: string }>();
+        const defer = (pkg: PackageRecord, change: { impressions?: number; endMs?: number; impressionsField?: string }) => {
+          const entry = deferred.get(pkg.package_id);
+          if (entry) Object.assign(entry, change);
+          else deferred.set(pkg.package_id, { pkg, ...change });
+        };
         if (patch.end_time !== undefined) {
           const endMs = parseInstant(patch.end_time, 'end_time', market.nowMs);
           buy.end_time = new Date(endMs).toISOString();
+          const { calendar } = market.sim.traffic;
+          const endDay = Math.ceil((endMs - calendar.startMs) / DAY_MS);
           for (const pkg of buy.packages) {
             if (pkg.canceled) continue;
-            pkg.end_time = buy.end_time;
-            apply(pkg, { flight_end_ms: endMs }, 'end_time');
+            // A package whose end day is unchanged keeps its flight and is not re-weighed.
+            if (endDay === market.sim.booking(pkg.package_id).flight_end_day) pkg.end_time = new Date(endMs).toISOString();
+            else defer(pkg, { endMs });
           }
         }
-        // Raised goals go in after every other change, so each is weighed
-        // against what the whole request leaves, whatever its package order.
-        const raised: Array<{ pkg: PackageRecord; impressions: number; field: string }> = [];
         (Array.isArray(patch.packages) ? patch.packages : []).forEach((change: Record<string, unknown>, index: number) => {
           const field = `packages[${index}]`;
           const pkg = buy.packages.find(candidate => candidate.package_id === change.package_id);
@@ -790,7 +799,7 @@ export class InventoryPlatform implements DecisioningPlatform<{ strict: boolean 
           }
           if (typeof change.impressions === 'number') {
             if (change.impressions > (market.sim.booking(pkg.package_id).impression_goal ?? Number.POSITIVE_INFINITY)) {
-              raised.push({ pkg, impressions: change.impressions, field: `${field}.impressions` });
+              defer(pkg, { impressions: change.impressions, impressionsField: `${field}.impressions` });
             } else {
               pkg.impressions = change.impressions;
               apply(pkg, { impression_goal: change.impressions }, `${field}.impressions`);
@@ -816,18 +825,41 @@ export class InventoryPlatform implements DecisioningPlatform<{ strict: boolean 
             if (!pkg.canceled) apply(pkg, { status: patch.paused || pkg.paused ? 'paused' : 'active' }, 'paused');
           }
         }
-        for (const { pkg, impressions, field } of raised) {
-          pkg.impressions = impressions;
-          apply(pkg, { impression_goal: impressions }, field);
+        // A package canceled later in the request takes no deferred change.
+        // Shortened ends go in first, so the extensions and raises after them are weighed against the inventory they free.
+        const frees = (entry: { pkg: PackageRecord; impressions?: number; endMs?: number }) => {
+          if (entry.endMs === undefined || entry.impressions !== undefined) return false;
+          const endDay = Math.ceil((entry.endMs - market.sim.traffic.calendar.startMs) / DAY_MS);
+          return endDay < market.sim.booking(entry.pkg.package_id).flight_end_day;
+        };
+        const live = [...deferred.values()].filter(entry => !entry.pkg.canceled)
+          .map(entry => ({ entry, frees: frees(entry) }))
+          .sort((a, b) => Number(b.frees) - Number(a.frees))
+          .map(({ entry }) => entry);
+        const fieldOf = (entry: { impressions?: number; impressionsField?: string }) =>
+          entry.impressions !== undefined && entry.impressionsField ? entry.impressionsField : 'end_time';
+        for (const entry of live) {
+          const { pkg, impressions, endMs } = entry;
+          const change: Parameters<InventorySimulation['update']>[1] = {};
+          if (impressions !== undefined) {
+            pkg.impressions = impressions;
+            change.impression_goal = impressions;
+          }
+          if (endMs !== undefined) {
+            pkg.end_time = new Date(endMs).toISOString();
+            change.flight_end_ms = endMs;
+          }
+          apply(pkg, change, fieldOf(entry));
         }
-        // Each raise was weighed before the ones after it went in; weigh them
-        // all again against the state they leave together.
-        if (raised.length > 1) {
-          for (const { pkg, field } of raised) {
+        // Each deferred change (a raised goal or a moved flight end) was weighed
+        // before the ones after it went in; weigh them all again against the
+        // state they leave together.
+        if (live.length > 1) {
+          for (const entry of live) {
             try {
-              market.sim.requireGoalAvailable(pkg.package_id, market.nowMs);
+              market.sim.requireGoalAvailable(entry.pkg.package_id, market.nowMs);
             } catch (error) {
-              fromEngine(error, field);
+              fromEngine(error, fieldOf(entry));
             }
           }
         }
