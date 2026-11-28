@@ -987,6 +987,10 @@ describe('inventory tenants', () => {
       const truth = await controller(token, 'simulation_truth', { include: ['cell_daily_actuals'], start_date: truthStart.toISOString().slice(0, 10), end_date: truthEnd.toISOString().slice(0, 10) });
       expect(truth.success, JSON.stringify(truth).slice(0, 500)).toBe(true);
       expect(truth.seed_id).toBe(ADSERVER_SEASON.seed_id);
+      expect(truth.season_fingerprint).toBe(seasonFingerprint(INVENTORY_TENANT_PROFILES[tenant].seed));
+      expect(truth.engine_version).toBe(ENGINE_VERSION);
+      const clockNow = await controller(token, 'sandbox_clock', { operation: 'get' });
+      expect(clockNow.simulated).toMatchObject({ seed_id: truth.seed_id, season_fingerprint: truth.season_fingerprint, engine_version: truth.engine_version });
       expect(truth.processed_through_date).toBe(truthEnd.toISOString().slice(0, 10));
       expect(truth.world.regions.map((region: Structured) => region.region_id)).toContain('us_west');
       expect(truth.packages).toHaveLength(2);
@@ -1079,7 +1083,7 @@ describe('inventory tenants', () => {
       ];
       for (const read of reads) {
         const text = JSON.stringify(read);
-        for (const field of ['profile_id', 'cells', 'rate_multipliers', 'delivered_rates', 'cell_daily_actuals']) {
+        for (const field of ['profile_id', 'cells', 'rate_multipliers', 'delivered_rates', 'cell_daily_actuals', 'season_fingerprint', 'engine_version']) {
           expect(text, field).not.toContain(field);
         }
       }

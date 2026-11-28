@@ -198,7 +198,7 @@ Seeded products are private to your credential, like your buys. A credential tha
 
 The response has:
 
-- `seed_id`, `simulated_now` and `processed_through_date`, the last day that ran. `processed_through_date` is absent until a day has run.
+- `seed_id`, `season_fingerprint`, `engine_version`, `simulated_now` and `processed_through_date`, the last day that ran. `processed_through_date` is absent until a day has run. `seed_id`, `season_fingerprint` and `engine_version` are the same values `sandbox_clock` reports in its `simulated` block, so a score can record which season and engine it ran against.
 - `world`: the `regions` with their traffic `share`, the audience profiles with their `share` and `rate_multipliers`, and the `segments` with their `profile_ids`.
 - `packages`: for each package, its `package_id`, `media_buy_id`, `account_id`, `product_id`, `kind`, `status`, `impression_goal` (guaranteed packages), `cpm` and the `targeting` it booked as region and profile ids, with what it `delivered`. Its `cells` break delivery down by region, property, placement and audience profile. Each cell has the `rates` it is drawn around and the `delivered_rates` the package saw.
 - With `cell_daily_actuals`: a `cell_index` that labels each cell by `cell_id`, and `cell_daily_actuals`, one entry per day: `[{ "date": "2027-01-01", "actuals": [[cell_id, impressions], ...] }]`.

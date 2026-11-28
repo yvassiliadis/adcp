@@ -8,8 +8,9 @@
  * It is sandbox-only and read-only: the market is opened caught up to the
  * clock and never saved, and the clock is untouched.
  */
-import { simulationTruth, type SeasonSeed } from './engine/index.js';
+import { ENGINE_VERSION, simulationTruth, type SeasonSeed } from './engine/index.js';
 import { openMarket } from './market-store.js';
+import { seasonFingerprint } from './season-file.js';
 
 export const SIMULATION_TRUTH_SCENARIO = 'simulation_truth';
 
@@ -111,6 +112,8 @@ export async function handleSimulationTruth(
   return {
     success: true,
     seed_id: truth.seed_id,
+    season_fingerprint: seasonFingerprint(market.seed),
+    engine_version: ENGINE_VERSION,
     simulated_now: open.nowIso,
     ...(truth.processed_through_day > 0 && { processed_through_date: calendar.dateOf(truth.processed_through_day - 1) }),
     world: truth.world,
