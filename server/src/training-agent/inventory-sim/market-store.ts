@@ -40,7 +40,10 @@ export interface PackageRecord {
   impressions?: number;
   bid_price?: number;
   installment_ids?: string[];
+  /** Country codes of a package stored without a `targeting_overlay`; echoed as `geo_countries`. */
   countries?: string[];
+  /** The package's targeting overlay as echoed back. */
+  targeting_overlay?: Record<string, unknown>;
   start_time: string;
   end_time: string;
   paused: boolean;

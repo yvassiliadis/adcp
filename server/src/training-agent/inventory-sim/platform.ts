@@ -41,6 +41,7 @@ import {
   type CreativeCatalog,
   type CreativeError,
 } from './creatives.js';
+import { TargetingError, parseOverlay, type ParsedOverlay, productTargetingFields, supportsOverlayRequirements, validateOverlayGlobally } from './targeting.js';
 import { catalogIdOf, formatFilter, listSeedCreativeFormats, resolveCreativeFormat, seedFormatDeclarations, wireFormat, type FormatDeclaration } from './creative-wire.js';
 import { engineProducts, fixedPrice, floorPrice, seededPricing, wireOverrides, wirePricing, type SeededCatalog, type SeededPricingRecord, type SeededProductRecord } from './seeded-products.js';
 import type { TrainingContext } from '../types.js';
@@ -95,6 +96,11 @@ function isContext(value: unknown): value is Record<string, unknown> {
 function creativeFailure(error: CreativeError): AdcpError {
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   return new AdcpError(error.code as any, { recovery: 'correctable', message: error.message, ...(error.field && { field: error.field }) });
+}
+
+function targetingFailure(error: unknown): unknown {
+  if (!(error instanceof TargetingError)) return error;
+  return new AdcpError(error.code, { recovery: 'correctable', message: error.message, field: error.field });
 }
 
 function fromEngine(error: unknown, field?: string): never {
@@ -195,6 +201,7 @@ export class InventoryPlatform implements DecisioningPlatform<{ strict: boolean 
       creative_agents: [],
       channels: channels as never,
       pricingModels: ['cpm'] as const,
+      targeting: { geo_countries: true },
       supportedBillings: ['agent', 'operator'] as const,
       // An inventory agent is read as a wholesale catalogue by the storefront
       // in front of it, as well as briefed directly.
@@ -354,16 +361,15 @@ export class InventoryPlatform implements DecisioningPlatform<{ strict: boolean 
     };
   }
 
-  private targetingFrom(overlay: unknown, field: string): BookingTargeting {
-    const countries = (overlay as { geo_countries?: unknown } | undefined)?.geo_countries;
-    if (countries === undefined) return {};
-    if (!Array.isArray(countries) || countries.some(country => typeof country !== 'string')) {
-      throw invalid('geo_countries must be an array of ISO 3166-1 alpha-2 codes', `${field}.geo_countries`);
+  /** A product's engine targeting and echoed overlay for a request's
+   * `targeting_overlay`; a refusal becomes the AdCP error with the same code
+   * and field. */
+  private parseTargeting(overlay: unknown, product: SeedProduct, field: string): ParsedOverlay {
+    try {
+      return parseOverlay(overlay, this.profile.seed, product, field);
+    } catch (error) {
+      throw targetingFailure(error);
     }
-    const wanted = new Set(countries.map(country => String(country).toUpperCase()));
-    const regionIds = this.profile.seed.regions.filter(region => wanted.has(region.country)).map(region => region.region_id);
-    if (regionIds.length === 0) throw invalid(`No inventory in ${[...wanted].join(', ')}`, `${field}.geo_countries`);
-    return { region_ids: regionIds };
   }
 
   /** Installments a collection product sells that are scheduled within the
@@ -463,7 +469,7 @@ export class InventoryPlatform implements DecisioningPlatform<{ strict: boolean 
         // say) over these defaults, which fill the fields the schema requires.
         ...(seeded && isContext(seeded.record.fixture.reporting_capabilities) && structuredClone(seeded.record.fixture.reporting_capabilities)),
       },
-      overlay_support: { geo_countries: true },
+      ...productTargetingFields(seed, product),
       ...(installments && {
         collections: (product.collection_ids ?? []).map(id => {
           const collection = sim.traffic.collections.get(id)!;
@@ -489,6 +495,7 @@ export class InventoryPlatform implements DecisioningPlatform<{ strict: boolean 
   }
 
   private wirePackage(pkg: PackageRecord, currency: string) {
+    const overlay = pkg.targeting_overlay ?? (pkg.countries && { geo_countries: pkg.countries });
     return {
       package_id: pkg.package_id,
       product_id: pkg.product_id,
@@ -497,7 +504,7 @@ export class InventoryPlatform implements DecisioningPlatform<{ strict: boolean 
       currency,
       ...(pkg.impressions !== undefined && { impressions: pkg.impressions }),
       ...(pkg.bid_price !== undefined && { bid_price: pkg.bid_price }),
-      ...(pkg.countries && { targeting_overlay: { geo_countries: pkg.countries } }),
+      ...(overlay && { targeting_overlay: overlay }),
       start_time: pkg.start_time,
       end_time: pkg.end_time,
       paused: pkg.paused,
@@ -580,7 +587,39 @@ export class InventoryPlatform implements DecisioningPlatform<{ strict: boolean 
         : startMs + DEFAULT_FORECAST_DAYS * DAY_MS;
       if (endMs <= startMs) throw invalid('filters.end_date must not be before filters.start_date', 'filters.end_date');
       const countries = Array.isArray(filters.countries) ? filters.countries : undefined;
-      const targeting = countries ? this.targetingFrom({ geo_countries: countries }, 'filters') : {};
+      const requestOverlay = req.targeting_overlay;
+      if (requestOverlay !== undefined && requestOverlay !== null) {
+        try {
+          validateOverlayGlobally(requestOverlay, this.profile.seed, 'targeting_overlay');
+        } catch (error) {
+          throw targetingFailure(error);
+        }
+      }
+      const requiredOverlaySupport = req.required_overlay_support;
+      /** The targeting a product is forecast under: the request's overlay
+       * intersected with legacy `filters.countries`; undefined when the
+       * product cannot serve it. */
+      const targetingFor = (product: SeedProduct): BookingTargeting | undefined => {
+        try {
+          const { targeting } = this.parseTargeting(requestOverlay, product, 'targeting_overlay');
+          if (!countries) return targeting;
+          let wanted: string[];
+          try {
+            wanted = parseOverlay({ geo_countries: countries }, this.profile.seed, product, 'filters').targeting.region_ids ?? [];
+          } catch (error) {
+            if (error instanceof TargetingError) {
+              throw new TargetingError(error.code, error.message, error.field.replace(/^filters\.geo_countries/, 'filters.countries'));
+            }
+            throw error;
+          }
+          const regionIds = targeting.region_ids ? targeting.region_ids.filter(id => wanted.includes(id)) : wanted;
+          return regionIds.length > 0 ? { ...targeting, region_ids: regionIds } : undefined;
+        } catch (error) {
+          const refusal = targetingFailure(error);
+          if (refusal instanceof AdcpError && (refusal.code === 'UNSUPPORTED_FEATURE' || refusal.code === 'PRODUCT_UNAVAILABLE')) return undefined;
+          throw refusal;
+        }
+      };
       const budgetMax = (filters.budget_range as { max?: unknown } | undefined)?.max;
       const budget = typeof budgetMax === 'number' && budgetMax > 0 ? budgetMax : undefined;
       const channels = Array.isArray(filters.channels) ? new Set(filters.channels as string[]) : undefined;
@@ -603,7 +642,11 @@ export class InventoryPlatform implements DecisioningPlatform<{ strict: boolean 
       const products = [...catalogue.filter(product => seededIds.has(product.product_id)), ...catalogue.filter(product => !seededIds.has(product.product_id))]
         .filter(product => filters.delivery_type === undefined || product.delivery_type === filters.delivery_type)
         .filter(product => !channels || this.channelsOf(market, product).some(channel => channels.has(channel)))
-        .map(product => this.wireProduct(product, sim, market.nowMs, { startMs, endMs }, targeting, budget, this.seededProduct(market, product.product_id)))
+        .flatMap(product => {
+          const targeting = targetingFor(product);
+          return targeting ? [this.wireProduct(product, sim, market.nowMs, { startMs, endMs }, targeting, budget, this.seededProduct(market, product.product_id))] : [];
+        })
+        .filter(product => supportsOverlayRequirements((product as { overlay_support?: unknown }).overlay_support, requiredOverlaySupport))
         .filter(product => !formatRefs || servesFormatOptionRef(product, formatRefs))
         // Filter, never fail: a product must report every required metric, a
         // declared container (viewability) covering its leaves (viewable_rate).
@@ -651,7 +694,7 @@ export class InventoryPlatform implements DecisioningPlatform<{ strict: boolean 
         const rate = this.optionCpm(product, seededOption);
         const startMs = pkg.start_time !== undefined ? parseInstant(pkg.start_time, `${field}.start_time`, market.nowMs) : buyStart;
         const endMs = pkg.end_time !== undefined ? parseInstant(pkg.end_time, `${field}.end_time`, market.nowMs) : buyEnd;
-        const targeting = this.targetingFrom(pkg.targeting_overlay, `${field}.targeting_overlay`);
+        const { targeting, echo } = this.parseTargeting(pkg.targeting_overlay, product, `${field}.targeting_overlay`);
         const bid = typeof pkg.bid_price === 'number' ? pkg.bid_price : undefined;
         const impressions = typeof pkg.impressions === 'number' ? pkg.impressions : undefined;
         let bookingEndMs = endMs;
@@ -690,7 +733,7 @@ export class InventoryPlatform implements DecisioningPlatform<{ strict: boolean 
           ...(booking.impression_goal !== undefined && { impressions: booking.impression_goal }),
           ...(booking.kind === 'auction' && { bid_price: booking.cpm }),
           ...(targeting.installment_ids && { installment_ids: targeting.installment_ids }),
-          ...(targeting.region_ids && { countries: [...new Set((pkg.targeting_overlay as { geo_countries: string[] }).geo_countries.map(c => c.toUpperCase()))] }),
+          ...(echo && { targeting_overlay: echo }),
           start_time: new Date(startMs).toISOString(),
           end_time: new Date(endMs).toISOString(),
           paused: false,
@@ -740,6 +783,12 @@ export class InventoryPlatform implements DecisioningPlatform<{ strict: boolean 
       if (typeof patch.revision === 'number' && patch.revision !== buy.revision) {
         throw new AdcpError('CONFLICT', { recovery: 'correctable', message: `Media buy ${buyId} is at revision ${buy.revision}`, field: 'revision' });
       }
+      // Targeting is set when a package is booked: refuse it before any change applies.
+      (Array.isArray(patch.packages) ? patch.packages : []).forEach((change: Record<string, unknown>, index: number) => {
+        if (change.targeting_overlay !== undefined) {
+          throw new AdcpError('UNSUPPORTED_FEATURE', { recovery: 'correctable', message: 'A booked package\'s targeting_overlay cannot be changed', field: `packages[${index}].targeting_overlay` });
+        }
+      });
       const affected = new Set<string>();
       const apply = (pkg: PackageRecord, change: Parameters<InventorySimulation['update']>[1], field: string) => {
         try {

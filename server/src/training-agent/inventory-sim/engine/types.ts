@@ -260,6 +260,9 @@ export type BookingStatus = 'active' | 'paused' | 'canceled';
 export interface BookingTargeting {
   region_ids?: string[];
   segment_ids?: string[];
+  /** Audience profiles to serve. Intersects with segments and the product's
+   * segment. A defined empty list matches no cell. */
+  profile_ids?: string[];
   installment_ids?: string[];
 }
 

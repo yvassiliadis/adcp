@@ -56,7 +56,7 @@ import {
 } from '../task-handlers.js';
 import { sellerOptimizedDeclarationForVersion, sellerOptimizedFeatureFlags } from '../seller-optimized-budget.js';
 import { supportsAccountChangeFeed, supportsAccountSurfaces33, TRAINING_AGENT_REGISTERS_ACCOUNT_SURFACES_33, supportsBiddingPolicyCapability, TRAINING_BIDDING_POLICY_CAPABILITY, supportsGetProductsRejected, supportsReliableReporting, supportsReportingStatus, supportsSalesFixedRate, supportsSellerGovernanceDiscovery, TRAINING_AGENT_CURRENT_ADCP_VERSION, TRAINING_AGENT_DEFAULT_ADCP_VERSION, TRAINING_AGENT_STABLE_REGISTRY_VERSIONS, TRAINING_AGENT_SUPPORTED_RELEASE_VERSIONS, type TrainingContext } from '../types.js';
-import { getIdentityBaseUrl } from '../config.js';
+import { TRAINING_AGENT_URL, getAgentUrl, getIdentityBaseUrl } from '../config.js';
 import { complianceScenariosForServedVersion } from '../compliance-scenarios.js';
 import { omitFieldsAddedAfterRelease, servedLifecycleTools, servedReleaseEnum } from '../served-release-fields.js';
 import { toolsForTenant } from './tool-catalog.js';
@@ -81,7 +81,9 @@ import { grantFor, grantPermits, loadSandbox } from '../account-sandbox.js';
 import { projectCollectionCapabilities } from '../collections/capabilities.js';
 import { supportsCollections33 } from '../collections/card-catalog.js';
 import { SEED_COLLECTION_SCENARIO } from '../collections/seed-collection.js';
-import { INVENTORY_COMPLY_SCENARIOS, handleInventorySandboxClock, isInventoryTenant } from './inventory.js';
+import { INVENTORY_ADSERVER_TENANT_ID, INVENTORY_COMPLY_SCENARIOS, INVENTORY_TENANT_PROFILES, handleInventorySandboxClock, handleInventorySimulationTruth, isInventoryTenant } from './inventory.js';
+import { SIMULATION_TRUTH_SCENARIO } from '../inventory-sim/truth-scenario.js';
+import { PLACE_CATALOG_VERSION, placeSystem, placeType, resolveGeoPlaces } from '../inventory-sim/geo-places.js';
 import { SANDBOX_CLOCK_SCENARIO } from '../inventory-sim/sandbox-clock.js';
 
 const logger = createLogger('training-agent-tenant-router');
@@ -778,9 +780,10 @@ async function tryRefuseByAccountGrant(
 }
 
 /**
- * Inventory tenants (#9025): `sandbox_clock`, and a `list_scenarios` that
- * names it, answered here because the SDK's controller config has no slot
- * for a scenario of our own. `reset_state` goes through the SDK.
+ * Inventory tenants (#9025): `sandbox_clock` and `simulation_truth`, and a
+ * `list_scenarios` that names them, answered here because the SDK's
+ * controller config has no slot for a scenario of our own. `reset_state` goes
+ * through the SDK.
  */
 async function tryHandleInventoryComplyScenario(
   req: Request,
@@ -792,7 +795,8 @@ async function tryHandleInventoryComplyScenario(
   if (!isInventoryTenant(tenantId)) return false;
   if (req.body?.method !== 'tools/call' || req.body?.params?.name !== 'comply_test_controller') return false;
   const rawArgs = (req.body.params.arguments ?? {}) as Record<string, unknown>;
-  if (rawArgs.scenario !== SANDBOX_CLOCK_SCENARIO && rawArgs.scenario !== 'list_scenarios') return false;
+  const scenarioName = rawArgs.scenario;
+  if (scenarioName !== SANDBOX_CLOCK_SCENARIO && scenarioName !== SIMULATION_TRUTH_SCENARIO && scenarioName !== 'list_scenarios') return false;
   const { context, ...handlerArgs } = rawArgs;
   const versionResolution = resolveServedAdcpVersion(handlerArgs, routeVersions);
   if (!versionResolution.ok) {
@@ -811,12 +815,14 @@ async function tryHandleInventoryComplyScenario(
   const result = rawArgs.scenario === 'list_scenarios'
     ? { success: true, scenarios: [...INVENTORY_COMPLY_SCENARIOS] }
     : account && typeof account === 'object' && account.sandbox === false
-      ? { success: false, error: 'FORBIDDEN', error_detail: 'sandbox_clock is sandbox only' }
+      ? { success: false, error: 'FORBIDDEN', error_detail: `${String(scenarioName)} is sandbox only` }
       : await runWithSessionContext(async () => {
         const params = rawArgs.params && typeof rawArgs.params === 'object' && !Array.isArray(rawArgs.params)
           ? rawArgs.params as Record<string, unknown>
           : {};
-        const body = await handleInventorySandboxClock(tenantId, params, principal);
+        const body = scenarioName === SIMULATION_TRUTH_SCENARIO
+          ? await handleInventorySimulationTruth(tenantId, params, principal)
+          : await handleInventorySandboxClock(tenantId, params, principal);
         await flushDirtySessions();
         return body;
       });
@@ -1179,6 +1185,40 @@ function stripContentLengthOnWriteHead(res: Response): void {
       }
     }
     return original(...next);
+  };
+}
+
+/** Declares the ad server's place system under `execution.targeting.geo_places`,
+ * beside whatever targeting the SDK declared. */
+function advertiseGeoPlaces(mediaBuy: Record<string, unknown>): void {
+  const seed = INVENTORY_TENANT_PROFILES[INVENTORY_ADSERVER_TENANT_ID].seed;
+  const system = placeSystem();
+  const type = placeType(system);
+  const countries: Record<string, string[]> = {};
+  for (const region of seed.regions) countries[region.country] = [type];
+  const agentUrl = getAgentUrl();
+  const base = agentUrl.startsWith('https://') ? agentUrl : TRAINING_AGENT_URL;
+  const execution = (mediaBuy.execution && typeof mediaBuy.execution === 'object' ? mediaBuy.execution : {}) as Record<string, unknown>;
+  const targeting = (execution.targeting && typeof execution.targeting === 'object' ? execution.targeting : {}) as Record<string, unknown>;
+  mediaBuy.execution = {
+    ...execution,
+    targeting: {
+      ...targeting,
+      geo_places: {
+        [system]: {
+          countries,
+          catalog: {
+            current_version: PLACE_CATALOG_VERSION,
+            supported_versions: [PLACE_CATALOG_VERSION],
+            resolver: {
+              url: `${base}/${INVENTORY_ADSERVER_TENANT_ID}/geo-places`,
+              auth: 'none',
+              protocol: 'adcp_geo_place_resolver_v1',
+            },
+          },
+        },
+      },
+    },
   };
 }
 
@@ -1588,6 +1628,9 @@ function projectTenantCapabilities(
         ...(structured.compliance_testing && typeof structured.compliance_testing === 'object' ? structured.compliance_testing : {}),
         scenarios: [...INVENTORY_COMPLY_SCENARIOS],
       };
+      if (tenantId === INVENTORY_ADSERVER_TENANT_ID && structured.media_buy && typeof structured.media_buy === 'object') {
+        advertiseGeoPlaces(structured.media_buy);
+      }
     }
     // Every tenant: a release whose capabilities schema closes the scenario
     // enum (3.0) never sees scenarios added after it, whichever projection
@@ -1844,6 +1887,15 @@ export function mountTenantRoutes(
       ...(tenantId === 'governance' ? governanceMw : tenantId === 'sales' ? salesMw : mw),
       tenantMcpHandler(holder, tenantId, middleware.storyboardCompat, undefined, previewHolder),
     );
+    if (tenantId === INVENTORY_ADSERVER_TENANT_ID) {
+      // The place resolver the ad server's capabilities advertise. Public: it
+      // publishes the seed's region catalogue and nothing per caller.
+      parent.get(`/${tenantId}/geo-places`, (req, res) => {
+        setCORSHeaders(res);
+        const result = resolveGeoPlaces(INVENTORY_TENANT_PROFILES[tenantId].seed, req.query as Record<string, unknown>);
+        res.status(result.status).json(result.body);
+      });
+    }
     parent.get(`/${tenantId}/mcp`, (_req, res) => {
       setCORSHeaders(res);
       res.setHeader('Allow', 'POST, OPTIONS');

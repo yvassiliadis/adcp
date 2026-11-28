@@ -12,9 +12,11 @@
  *   their dates, and each builds its audience over its channel's curve.
  *
  * Their `comply_test_controller` serves `sandbox_clock` (get and advance the
- * caller's sandbox clock; the router intercepts it, as the SDK's controller
- * config has no slot for it) and `reset_state` (unpin the clock and discard
- * the caller's markets on every inventory tenant).
+ * caller's sandbox clock) and `simulation_truth` (a sandbox readout of what
+ * the caller's market actually did); the router intercepts both, as the SDK's
+ * controller config has no slot for them. It also serves `reset_state`
+ * (unpin the clock and discard the caller's markets on every inventory
+ * tenant).
  *
  * They speak the media-buy protocol as it is; no new tasks. They are not in
  * the host's brand.json or adagents.json tenant listings.
@@ -28,6 +30,7 @@ import { TRAINING_FORMAT_LABELS } from '../product-factory.js';
 import { createLogger } from '../../logger.js';
 import { resetMarket, withCallerMarkets } from '../inventory-sim/market-store.js';
 import { SANDBOX_CLOCK_SCENARIO, handleSandboxClock } from '../inventory-sim/sandbox-clock.js';
+import { SIMULATION_TRUTH_SCENARIO, handleSimulationTruth } from '../inventory-sim/truth-scenario.js';
 import { resetReportingSubscriptionProbe } from '../subscription-probe.js';
 import { getTenantSigningMaterial } from './signing.js';
 import { listAccountsTool } from './account-tools.js';
@@ -92,7 +95,7 @@ export function isInventoryTenant(tenantId: string): boolean {
 }
 
 /** Controller scenarios an inventory tenant lists. */
-export const INVENTORY_COMPLY_SCENARIOS: readonly string[] = ['reset_state', SANDBOX_CLOCK_SCENARIO, 'seed_account', 'seed_product', 'seed_pricing_option'];
+export const INVENTORY_COMPLY_SCENARIOS: readonly string[] = ['reset_state', SANDBOX_CLOCK_SCENARIO, SIMULATION_TRUTH_SCENARIO, 'seed_account', 'seed_product', 'seed_pricing_option'];
 
 /** `sandbox_clock` for a caller, called on one inventory tenant. Moving the
  * clock runs the market's days, so it is one of the caller's market requests. */
@@ -102,6 +105,13 @@ export function handleInventorySandboxClock(tenantId: string, params: Record<str
     { mode: 'open', principal: principal ?? 'anonymous' },
     INVENTORY_TENANT_PROFILES[tenantId],
   ));
+}
+
+/** `simulation_truth` for a caller, called on one inventory tenant. Opening
+ * the market catches it up to the clock, so it is one of the caller's market
+ * requests; nothing is saved. */
+export function handleInventorySimulationTruth(tenantId: string, params: Record<string, unknown>, principal: string | undefined) {
+  return withCallerMarkets(principal, () => handleSimulationTruth(params, INVENTORY_TENANT_PROFILES[tenantId], principal));
 }
 
 /** `reset_state`: unpin the caller's clock, which every tenant shares, and

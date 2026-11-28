@@ -43,6 +43,7 @@ export {
   type InstallmentState,
   type InstallmentStatus,
 } from './simulation.js';
+export { simulationTruth, type SimulationTruth, type SimulationTruthOptions, type TruthBooking, type TruthCell } from './truth.js';
 export { toAdcpForecast, type AdcpDeliveryForecast, type ForecastRange } from './forecast-shape.js';
 export { ENGINE_VERSION } from './version.js';
 export { ADSERVER_SEASON } from './seeds/adserver-season.js';

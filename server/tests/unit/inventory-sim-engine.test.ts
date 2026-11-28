@@ -18,6 +18,7 @@ import {
   takeEqualShare,
   standardNormal,
   takeShareOfVoice,
+  simulationTruth,
   toAdcpForecast,
   uniform,
   type CellCounts,
@@ -247,6 +248,59 @@ describe('traffic', () => {
     expect(() => new SeasonTraffic(scarceSeed({
       products: [{ product_id: 'x', name: 'x', description: 'x', delivery_type: 'guaranteed', placement_ids: ['missing'], rate_cpm: 1 }],
     }))).toThrow(/unknown placement/);
+  });
+});
+
+describe('profile targeting', () => {
+  it('restricts cells to the named profiles', () => {
+    const traffic = new SeasonTraffic(scarceSeed());
+    const all = traffic.eligibleCells('banner_guaranteed');
+    const p2 = traffic.eligibleCells('banner_guaranteed', { profile_ids: ['p2'] });
+    expect(all).toHaveLength(2);
+    expect(p2).toHaveLength(1);
+    expect(traffic.slots[p2[0]].profile_id).toBe('p2');
+    expect(traffic.eligibleCells('banner_guaranteed', { profile_ids: ['p1', 'p2'] })).toEqual(all);
+  });
+
+  it('intersects profile_ids with segments and with the product segment', () => {
+    const seed = scarceSeed();
+    seed.products.push({ product_id: 'banner_s1', name: 'S1', description: 'Segment one', delivery_type: 'guaranteed', placement_ids: ['banner'], segment_id: 's1', rate_cpm: 10 });
+    const traffic = new SeasonTraffic(seed);
+    expect(traffic.eligibleCells('banner_guaranteed', { segment_ids: ['s1'], profile_ids: ['p2'] })).toEqual([]);
+    expect(traffic.eligibleCells('banner_guaranteed', { segment_ids: ['s12'], profile_ids: ['p2'] })).toHaveLength(1);
+    expect(traffic.eligibleCells('banner_s1', { profile_ids: ['p2'] })).toEqual([]);
+    expect(traffic.eligibleCells('banner_s1', { profile_ids: ['p1', 'p2'] })).toHaveLength(1);
+  });
+
+  it('refuses an unknown profile', () => {
+    const traffic = new SeasonTraffic(scarceSeed());
+    expectEngineError(() => traffic.eligibleCells('banner_guaranteed', { profile_ids: ['nope'] }), 'INVALID_TARGETING');
+  });
+
+  it('treats a defined empty profile_ids or region_ids as zero cells, and absent as unrestricted', () => {
+    const traffic = new SeasonTraffic(scarceSeed());
+    expect(traffic.eligibleCells('banner_guaranteed', { profile_ids: [] })).toEqual([]);
+    expect(traffic.eligibleCells('banner_guaranteed', { region_ids: [] })).toEqual([]);
+    expect(traffic.eligibleCells('banner_guaranteed', { profile_ids: undefined, region_ids: undefined })).toHaveLength(2);
+  });
+
+  it('lists a segment\'s profiles and refuses an unknown segment', () => {
+    const traffic = new SeasonTraffic(scarceSeed());
+    expect(traffic.profilesOfSegment('s12')).toEqual(['p1', 'p2']);
+    expectEngineError(() => traffic.profilesOfSegment('nope'), 'INVALID_TARGETING');
+  });
+
+  it('expectedRates is the placement base times the profile multiplier, clamped to [0, 1]', () => {
+    const seed = scarceSeed();
+    seed.audience_profiles[0].rate_multipliers = { viewability: 2, click_rate: 3 };
+    const traffic = new SeasonTraffic(seed);
+    const p1 = traffic.slots.find(slot => slot.profile_id === 'p1')!.index;
+    const p2 = traffic.slots.find(slot => slot.profile_id === 'p2')!.index;
+    const rates = traffic.expectedRates(p1);
+    expect(rates.viewability).toBe(1);
+    expect(rates.click_rate).toBeCloseTo(0.003, 12);
+    expect(rates.conversion_rate).toBeCloseTo(0.02, 12);
+    expect(traffic.expectedRates(p2)).toEqual({ viewability: 0.7, click_rate: 0.001, completion_rate: 0, conversion_rate: 0.02 });
   });
 });
 
@@ -2399,5 +2453,114 @@ describe('goal availability from a dry run of delivery', () => {
     }
     const scarce = InventorySimulation.create(scarceSeed(), now);
     expect(availableOn(scarce, 'banner_guaranteed')).toBe(300_000);
+  });
+});
+
+describe('simulation truth', () => {
+  const now = at('2026-12-31T12:00:00Z');
+  const flight = { flight_start_ms: at('2027-01-01T00:00:00Z'), flight_end_ms: at('2027-01-31T00:00:00Z') };
+  const slotIndex = (sim: InventorySimulation, cell: { region_id: string; property_id: string; placement_id: string; profile_id: string; installment_id?: string }) =>
+    sim.traffic.slots.find(slot => slot.region_id === cell.region_id && slot.property_id === cell.property_id
+      && slot.placement_id === cell.placement_id && slot.profile_id === cell.profile_id && slot.installment_id === cell.installment_id)!.index;
+  const noisy = () => scarceSeed({ forecast_error: NOISY_FORECAST_ERROR });
+  const run = () => {
+    const sim = InventorySimulation.create(noisy(), now);
+    sim.book({ booking_id: 'a', product_id: 'banner_guaranteed', ...flight, budget: 10_000, impression_goal: 90_000 }, now);
+    sim.book({ booking_id: 'b', product_id: 'banner_auction', targeting: { profile_ids: ['p2'] }, ...flight, budget: 1_000_000, bid_cpm: 3 }, now);
+    sim.advanceTo(at('2027-01-11T00:00:00Z'));
+    return sim;
+  };
+
+  it('describes the world from the seed', () => {
+    const truth = simulationTruth(run());
+    expect(truth.seed_id).toBe('scarce-test');
+    expect(truth.processed_through_day).toBe(10);
+    expect(truth.world.regions).toEqual([{ region_id: 'r1', country: 'US', share: 1 }]);
+    expect(truth.world.audience_profiles.map(profile => profile.profile_id)).toEqual(['p1', 'p2']);
+    expect(truth.world.segments).toEqual([
+      { segment_id: 's1', profile_ids: ['p1'] },
+      { segment_id: 's12', profile_ids: ['p1', 'p2'] },
+    ]);
+  });
+
+  it('sums cell impressions to the booking delivered impressions and tracks the other metrics', () => {
+    const sim = run();
+    const truth = simulationTruth(sim);
+    expect(truth.bookings.map(booking => booking.booking_id)).toEqual(['a', 'b']);
+    for (const booking of truth.bookings) {
+      const live = sim.booking(booking.booking_id);
+      const daysServed = live.days.length;
+      expect(booking.delivered).toEqual(live.delivered);
+      expect(booking.cells.reduce((sum, cell) => sum + cell.impressions, 0)).toBe(live.delivered.impressions);
+      const sum = (key: 'clicks' | 'viewable_impressions' | 'completed_views' | 'conversions') => booking.cells.reduce((acc, cell) => acc + cell[key], 0);
+      for (const key of ['clicks', 'viewable_impressions', 'completed_views', 'conversions'] as const) {
+        expect(Math.abs(sum(key) - live.delivered[key])).toBeLessThanOrEqual(0.5 * daysServed);
+      }
+      const indices = booking.cells.map(cell => slotIndex(sim, cell));
+      expect([...indices].sort((x, y) => x - y)).toEqual(indices);
+    }
+    const b = truth.bookings[1];
+    expect(b.cells).toHaveLength(1);
+    expect(b.cells[0]).toMatchObject({ region_id: 'r1', property_id: 'site', placement_id: 'banner', profile_id: 'p2' });
+    expect(b.targeting).toEqual({ profile_ids: ['p2'] });
+  });
+
+  it('reports expected rates and impression-weighted delivered rates per cell', () => {
+    const sim = run();
+    const cell = simulationTruth(sim).bookings[1].cells[0];
+    expect(cell.rates).toEqual(sim.traffic.expectedRates(slotIndex(sim, cell)));
+    const live = sim.booking('b');
+    let viewable = 0;
+    for (const day of live.days) viewable += day.cells.reduce((sum, [index, count]) => sum + count * sim.traffic.rates(day.day, index).viewability, 0);
+    expect(cell.viewable_impressions).toBeCloseTo(viewable, 9);
+    expect(cell.delivered_rates.viewability).toBeCloseTo(viewable / cell.impressions, 12);
+    expect(cell.delivered_rates.conversion_rate).toBeCloseTo(cell.conversions / cell.clicks, 12);
+  });
+
+  it('reports a zero delivered conversion rate when a cell has no clicks', () => {
+    const seed = scarceSeed();
+    seed.placements[0].rates.click_rate = 0;
+    const sim = InventorySimulation.create(seed, now);
+    sim.book({ booking_id: 'z', product_id: 'banner_auction', ...flight, budget: 1000, bid_cpm: 3 }, now);
+    sim.advanceTo(at('2027-01-04T00:00:00Z'));
+    const cell = simulationTruth(sim).bookings[0].cells[0];
+    expect(cell.clicks).toBe(0);
+    expect(cell.delivered_rates.conversion_rate).toBe(0);
+  });
+
+  it('filters bookings by bookingIds', () => {
+    const truth = simulationTruth(run(), { bookingIds: ['b'] });
+    expect(truth.bookings.map(booking => booking.booking_id)).toEqual(['b']);
+  });
+
+  it('omits daily actuals unless requested', () => {
+    expect(simulationTruth(run())).not.toHaveProperty('dailyActuals');
+  });
+
+  it('returns daily actuals from the traffic table, never from a day at or after processed_through_day', () => {
+    const sim = run();
+    const truth = simulationTruth(sim, { dailyActuals: { startDay: 0, endDay: 40 } });
+    const { cell_index: index, cell_daily_actuals: daily } = truth.dailyActuals!;
+    expect(daily.map(entry => entry.date)).toEqual(Array.from({ length: 10 }, (_, d) => sim.traffic.calendar.dateOf(d)));
+    const ids = new Set(index.map(entry => entry.cell_id));
+    expect(ids.size).toBe(index.length);
+    daily.forEach((entry, d) => {
+      const table = sim.traffic.day(d).actual;
+      expect(entry.actuals.reduce((sum, [, n]) => sum + n, 0)).toBe([...table.values()].reduce((sum, n) => sum + n, 0));
+      for (const [cellId, n] of entry.actuals) {
+        expect(n).toBeGreaterThan(0);
+        expect(table.get(cellId)).toBe(n);
+        expect(ids.has(cellId)).toBe(true);
+      }
+    });
+    expect(index[0]).toEqual({ cell_id: 0, region_id: 'r1', property_id: 'site', placement_id: 'banner', profile_id: 'p1' });
+  });
+
+  it('bounds the daily actuals window to [startDay, endDay) and restricts the cell index to returned cells', () => {
+    const sim = run();
+    const truth = simulationTruth(sim, { dailyActuals: { startDay: 3, endDay: 5 } });
+    expect(truth.dailyActuals!.cell_daily_actuals.map(entry => entry.date)).toEqual([sim.traffic.calendar.dateOf(3), sim.traffic.calendar.dateOf(4)]);
+    const none = simulationTruth(sim, { dailyActuals: { startDay: 10, endDay: 20 } });
+    expect(none.dailyActuals).toEqual({ cell_index: [], cell_daily_actuals: [] });
   });
 });

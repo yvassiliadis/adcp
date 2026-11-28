@@ -14,9 +14,10 @@ import { flushDirtySessions, runWithSessionContext, stopSessionCleanup } from '.
 import { setSandboxWallClockForTesting } from '../../src/training-agent/account-sandbox.js';
 import { resetReportingSubscriptionProbe } from '../../src/training-agent/subscription-probe.js';
 import { getAgentUrl } from '../../src/training-agent/config.js';
-import { ENGINE_VERSION } from '../../src/training-agent/inventory-sim/engine/index.js';
 import { seasonFingerprint } from '../../src/training-agent/inventory-sim/season-file.js';
 import { INVENTORY_TENANT_PROFILES } from '../../src/training-agent/tenants/inventory.js';
+import { ADSERVER_SEASON, ENGINE_VERSION, InventorySimulation, toAdcpForecast } from '../../src/training-agent/inventory-sim/engine/index.js';
+import { placeSystem, placeType } from '../../src/training-agent/inventory-sim/targeting.js';
 
 const DAY_MS = 24 * 60 * 60 * 1000;
 /** Where an unpinned sandbox clock starts, so the seeds' scripted 2027
@@ -28,14 +29,19 @@ const BRAND = { domain: 'inventory-buyer.example' };
 
 type Structured = Record<string, any>;
 
-function expectCanonical(tool: string, value: Structured): void {
-  const validate = getCanonicalToolValidator(tool, 'sync', { adcpVersion: '3.2' }) as
+function expectCanonical(tool: string, value: Structured, adcpVersion = '3.2'): void {
+  const validate = getCanonicalToolValidator(tool, 'sync', { adcpVersion }) as
     | (((payload: unknown) => boolean) & { errors?: unknown })
     | undefined;
   expect(validate, `no canonical validator for ${tool}`).toBeDefined();
   if (value.adcp_error || value.__envelope) throw new Error(`${tool} failed: ${JSON.stringify(value).slice(0, 1500)}`);
   const ok = validate!(value);
   expect(ok, `${tool}: ${JSON.stringify(validate!.errors)?.slice(0, 1500)}`).toBe(true);
+}
+
+/** Validates against every AdCP version the tenants must satisfy. */
+function expectCanonicalAll(tool: string, value: Structured): void {
+  for (const version of ['3.2', '3.3.0-rc.3']) expectCanonical(tool, value, version);
 }
 
 describe('inventory tenants', () => {
@@ -738,6 +744,410 @@ describe('inventory tenants', () => {
         packages: [{ product_id: 'preroll_auction', pricing_option_id: 'preroll_auction_cpm', budget: 500, bid_price: 8, creatives: [banner('banner_on_video')] }],
       }, CREATIVE_TOKEN);
       expect(JSON.stringify(wrongFormat)).toContain('FORMAT_NOT_SUPPORTED');
+    });
+  });
+
+  describe('/inventory-adserver region and segment targeting', () => {
+    const tenant = 'inventory-adserver';
+    const start = new Date(Date.parse(WALL_CLOCK.slice(0, 10)) + 2 * DAY_MS);
+    const end = new Date(start.getTime() + 30 * DAY_MS);
+    const day = (date: Date) => date.toISOString().slice(0, 10);
+    const filters = { start_date: day(start), end_date: day(new Date(end.getTime() - DAY_MS)) };
+    const segment = (id: string, mode: 'any' | 'none' = 'any') => ({
+      operator: 'all',
+      groups: [{ operator: mode, signals: [{ signal_ref: { scope: 'product', signal_id: id }, value_type: 'binary', value: true }] }],
+    });
+    const products = (token: string, extra: Record<string, unknown> = {}) => call(tenant, 'get_products', {
+      buying_mode: 'wholesale', account: ACCOUNT, brand: BRAND, filters, ...extra,
+    }, token);
+    const book = (token: string, key: string, productId: string, overlay?: Record<string, unknown>, extra: Record<string, unknown> = {}) =>
+      call(tenant, 'create_media_buy', {
+        idempotency_key: `inventory-targeting-${key}`,
+        account: ACCOUNT,
+        brand: BRAND,
+        start_time: start.toISOString(),
+        end_time: end.toISOString(),
+        packages: [{
+          product_id: productId, pricing_option_id: `${productId}_cpm`, budget: 2000, impressions: 100_000,
+          ...(overlay && { targeting_overlay: overlay }), ...extra,
+        }],
+      }, token);
+    const failure = (result: Structured) => (result.adcp_error ?? result.errors?.[0] ?? result) as Structured;
+    const mid = (result: Structured, productId: string) =>
+      result.products.find((product: Structured) => product.product_id === productId).forecast.points[0].metrics.impressions.mid as number;
+
+    it('declares geo_countries targeting in its capabilities', async () => {
+      const token = 'demo-targeting-capabilities-v1';
+      await provision(token);
+      const capabilities = await call(tenant, 'get_adcp_capabilities', {}, token);
+      expectCanonicalAll('get_adcp_capabilities', capabilities);
+      expect(capabilities.media_buy.execution.targeting.geo_countries).toBe(true);
+    });
+
+    it('books a segment-targeted package, echoes its overlay, and forecasts for it', async () => {
+      const token = 'demo-targeting-segment-v1';
+      await provision(token);
+      const overlay = { signal_targeting_groups: segment('household_decision_makers') };
+
+      const before = await products(token, { targeting_overlay: overlay });
+      expectCanonicalAll('get_products', before);
+      const sim = InventorySimulation.create(ADSERVER_SEASON, Date.parse(WALL_CLOCK));
+      const profileIds = ADSERVER_SEASON.segments.find(candidate => candidate.segment_id === 'household_decision_makers')!.profile_ids;
+      const expected = toAdcpForecast(sim.forecast({
+        product_id: 'ros_display_guaranteed',
+        targeting: { profile_ids: profileIds },
+        flight_start_ms: start.getTime(),
+        flight_end_ms: end.getTime(),
+      }, Date.parse(WALL_CLOCK)), { guaranteed: true, generatedAt: '2026-11-20T09:00:00Z', validUntil: '2026-11-21T09:00:00Z' });
+      const wire = before.products.find((product: Structured) => product.product_id === 'ros_display_guaranteed');
+      expect(wire.forecast.points).toEqual(expected.points);
+      const untargeted = await products(token);
+      expect(mid(before, 'ros_display_guaranteed')).toBeLessThan(mid(untargeted, 'ros_display_guaranteed'));
+
+      const created = await book(token, 'segment-00000001', 'ros_display_guaranteed', overlay);
+      expectCanonicalAll('create_media_buy', created);
+      expect(created.packages[0].targeting_overlay).toEqual(overlay);
+      const listed = await call(tenant, 'get_media_buys', { account: ACCOUNT, media_buy_ids: [created.media_buy_id] }, token);
+      expect(listed.media_buys[0].packages[0].targeting_overlay).toEqual(overlay);
+    });
+
+    it('forecasts a targeted overlay lower after a competing segment booking', async () => {
+      const token = 'demo-targeting-competing-v1';
+      await provision(token);
+      const overlay = { signal_targeting_groups: segment('household_decision_makers') };
+      const before = await products(token, { targeting_overlay: overlay });
+      // The dry run only counts what delivery needs, so the competing goal
+      // takes all of its own forecast and must reach the shared cells.
+      const sports = mid(await products(token), 'sports_fans_display_guaranteed');
+      const competing = await book(token, 'competing-0000001', 'sports_fans_display_guaranteed', undefined, {
+        impressions: sports, budget: Math.ceil((sports * 12) / 1000) + 1,
+      });
+      expectCanonicalAll('create_media_buy', competing);
+      const after = await products(token, { targeting_overlay: overlay });
+      expect(mid(after, 'ros_display_guaranteed')).toBeLessThan(mid(before, 'ros_display_guaranteed'));
+    });
+
+    it('books a geo_places package and echoes the place system version', async () => {
+      const token = 'demo-targeting-places-v1';
+      await provision(token);
+      const entry = { country: 'US', system: placeSystem(), place_type: placeType(placeSystem()), values: ['us_west'] };
+      const created = await book(token, 'places-000000001', 'ros_display_guaranteed', { geo_places: [entry] });
+      expectCanonicalAll('create_media_buy', created);
+      expect(created.packages[0].targeting_overlay.geo_places).toEqual([{ ...entry, system_version: '1' }]);
+    });
+
+    it('refuses countries with no inventory on create and omits the product from get_products', async () => {
+      const token = 'demo-targeting-gb-v1';
+      await provision(token);
+      const created = await book(token, 'gb-0000000000001', 'ros_display_guaranteed', { geo_countries: ['GB'] });
+      expect(failure(created).code).toBe('PRODUCT_UNAVAILABLE');
+      const offered = await products(token, { targeting_overlay: { geo_countries: ['GB'] } });
+      expectCanonicalAll('get_products', offered);
+      expect(offered.products).toEqual([]);
+    });
+
+    it('refuses what the product does not take', async () => {
+      const token = 'demo-targeting-refusals-v1';
+      await provision(token);
+      const device = await book(token, 'device-0000000001', 'ros_display_guaranteed', { device_type: ['mobile'] });
+      expect(failure(device).code).toBe('UNSUPPORTED_FEATURE');
+      expect(failure(device).field).toBe('packages[0].targeting_overlay.device_type');
+
+      const takeover = await book(token, 'takeover-00000001', 'homepage_takeover_daily', { signal_targeting_groups: segment('sports_fans') });
+      expect(failure(takeover).code).toBe('UNSUPPORTED_FEATURE');
+
+      const unknown = await book(token, 'region-000000001', 'ros_display_guaranteed', {
+        geo_places: [{ country: 'US', system: placeSystem(), place_type: placeType(placeSystem()), values: ['atlantis'] }],
+      });
+      expect(failure(unknown).code).toBe('INVALID_REQUEST');
+
+      const created = await book(token, 'plain-0000000001', 'ros_display_guaranteed');
+      const updated = await call(tenant, 'update_media_buy', {
+        idempotency_key: 'inventory-targeting-update-000001',
+        account: ACCOUNT,
+        media_buy_id: created.media_buy_id,
+        packages: [{ package_id: created.packages[0].package_id, paused: true, targeting_overlay: { geo_countries: ['US'] } }],
+      }, token);
+      expect(failure(updated).code).toBe('UNSUPPORTED_FEATURE');
+      expect(failure(updated).field).toBe('packages[0].targeting_overlay');
+      const after = await call(tenant, 'get_media_buys', { account: ACCOUNT, media_buy_ids: [created.media_buy_id] }, token);
+      expect(after.media_buys[0].packages[0].paused).toBe(false);
+    });
+
+    it('filters get_products by the overlay, an unknown segment, and required_overlay_support', async () => {
+      const token = 'demo-targeting-discovery-v1';
+      await provision(token);
+      const withSignals = await products(token, { targeting_overlay: { signal_targeting_groups: segment('household_decision_makers') } });
+      const ids = withSignals.products.map((product: Structured) => product.product_id);
+      expect(ids).toContain('ros_display_guaranteed');
+      expect(ids).not.toContain('homepage_takeover_daily');
+
+      const unknown = await products(token, { targeting_overlay: { signal_targeting_groups: segment('no_such_segment') } });
+      expect(failure(unknown).code).toBe('INVALID_REQUEST');
+
+      const required = await products(token, { required_overlay_support: { signal_targeting_groups: true } });
+      expectCanonicalAll('get_products', required);
+      const requiredIds = required.products.map((product: Structured) => product.product_id);
+      expect(requiredIds).toContain('ros_display_guaranteed');
+      expect(requiredIds).not.toContain('homepage_takeover_daily');
+      for (const product of required.products) expect(product.overlay_support.signal_targeting_groups).toBe(true);
+    });
+
+    it('echoes geo_countries on a package stored with only countries', async () => {
+      const token = 'demo-targeting-legacy-v1';
+      await provision(token);
+      const created = await book(token, 'legacy-000000001', 'ros_display_guaranteed', { geo_countries: ['us'] });
+      expectCanonicalAll('create_media_buy', created);
+      expect(created.packages[0].targeting_overlay).toEqual({ geo_countries: ['US'] });
+
+      const { openMarket } = await import('../../src/training-agent/inventory-sim/market-store.js');
+      await runWithSessionContext(async () => {
+        const market = await openMarket(tenant, ADSERVER_SEASON, `static:demo:${token}`);
+        const stored = market.doc.media_buys[0].packages[0];
+        delete stored.targeting_overlay;
+        stored.countries = ['CA'];
+        market.save();
+        await flushDirtySessions();
+      });
+      const listed = await call(tenant, 'get_media_buys', { account: ACCOUNT, media_buy_ids: [created.media_buy_id] }, token);
+      expectCanonical('get_media_buys', listed);
+      expect(listed.media_buys[0].packages[0].targeting_overlay).toEqual({ geo_countries: ['CA'] });
+    });
+
+    it('treats legacy filters.countries as a region filter and names the bad entry', async () => {
+      const token = 'demo-targeting-countries-v1';
+      await provision(token);
+      const query = (countries: string[]) => call(tenant, 'get_products', {
+        buying_mode: 'wholesale', account: ACCOUNT, brand: BRAND, filters: { countries },
+      }, token);
+      const outside = await query(['GB']);
+      expect(outside.products).toEqual([]);
+      const invalid = await query(['USA']);
+      expect(failure(invalid).code).toBe('INVALID_REQUEST');
+      expect(failure(invalid).field).toBe('filters.countries[0]');
+    });
+  });
+
+  describe('simulation_truth and the geo-place resolver', () => {
+    const tenant = 'inventory-adserver';
+    const truthStart = new Date(Date.parse(WALL_CLOCK.slice(0, 10)) + 2 * DAY_MS);
+    const truthEnd = new Date(truthStart.getTime() + 30 * DAY_MS);
+    const flight = { start_time: truthStart.toISOString(), end_time: truthEnd.toISOString() };
+    const segment = (id: string) => ({
+      operator: 'all',
+      groups: [{ operator: 'any', signals: [{ signal_ref: { scope: 'product', signal_id: id }, value_type: 'binary', value: true }] }],
+    });
+    const controller = (token: string, scenario: string, params: Record<string, unknown>, account: Record<string, unknown> = ACCOUNT) =>
+      call(tenant, 'comply_test_controller', { scenario, account, params }, token);
+    const advanceTo = (token: string, to: string) => controller(token, 'sandbox_clock', { operation: 'advance_time', to });
+    const book = (token: string, key: string, packages: Array<Record<string, unknown>>) =>
+      call(tenant, 'create_media_buy', {
+        idempotency_key: `inventory-truth-${key}`, account: ACCOUNT, brand: BRAND, ...flight, packages,
+      }, token);
+    const productMid = async (token: string, productId: string) => {
+      const result = await call(tenant, 'get_products', {
+        buying_mode: 'wholesale', account: ACCOUNT, brand: BRAND,
+        filters: { start_date: truthStart.toISOString().slice(0, 10), end_date: new Date(truthEnd.getTime() - DAY_MS).toISOString().slice(0, 10) },
+      }, token);
+      return result.products.find((product: Structured) => product.product_id === productId)
+        .forecast.points[0].metrics.impressions.mid as number;
+    };
+
+    it('is listed, and refuses a non-sandbox account', async () => {
+      const token = 'demo-truth-listed-v1';
+      await provision(token);
+      const listed = await call(tenant, 'comply_test_controller', { scenario: 'list_scenarios', account: ACCOUNT }, token);
+      expect(listed.scenarios).toContain('simulation_truth');
+      const capabilities = await call(tenant, 'get_adcp_capabilities', {}, token);
+      expect(capabilities.compliance_testing.scenarios).toContain('simulation_truth');
+
+      const refused = await controller(token, 'simulation_truth', {}, { ...ACCOUNT, sandbox: false });
+      expect(refused.success).toBe(false);
+      expect(refused.error).toBe('FORBIDDEN');
+    });
+
+    it('reads per-cell truth for targeted packages and nothing past the processed day', async () => {
+      const token = 'demo-truth-cells-v1';
+      await provision(token);
+      const segmentBuy = await book(token, 'segment-00000001', [{
+        product_id: 'ros_display_guaranteed', pricing_option_id: 'ros_display_guaranteed_cpm', budget: 2000, impressions: 100_000,
+        targeting_overlay: { signal_targeting_groups: segment('household_decision_makers') },
+      }]);
+      expectCanonicalAll('create_media_buy', segmentBuy);
+      const placeBuy = await book(token, 'places-000000001', [{
+        product_id: 'ros_display_guaranteed', pricing_option_id: 'ros_display_guaranteed_cpm', budget: 2000, impressions: 100_000,
+        targeting_overlay: { geo_places: [{ country: 'US', system: placeSystem(), place_type: placeType(placeSystem()), values: ['us_west'] }] },
+      }]);
+      expectCanonicalAll('create_media_buy', placeBuy);
+
+      const flightEndPlusOne = new Date(truthEnd.getTime() + DAY_MS).toISOString();
+      const advanced = await advanceTo(token, flightEndPlusOne);
+      expect(advanced.success).toBe(true);
+
+      const truth = await controller(token, 'simulation_truth', { include: ['cell_daily_actuals'], start_date: truthStart.toISOString().slice(0, 10), end_date: truthEnd.toISOString().slice(0, 10) });
+      expect(truth.success, JSON.stringify(truth).slice(0, 500)).toBe(true);
+      expect(truth.seed_id).toBe(ADSERVER_SEASON.seed_id);
+      expect(truth.processed_through_date).toBe(truthEnd.toISOString().slice(0, 10));
+      expect(truth.world.regions.map((region: Structured) => region.region_id)).toContain('us_west');
+      expect(truth.packages).toHaveLength(2);
+
+      const bySegment = truth.packages.find((pkg: Structured) => pkg.package_id === segmentBuy.packages[0].package_id);
+      expect(bySegment.media_buy_id).toBe(segmentBuy.media_buy_id);
+      expect(bySegment.account_id).toBeTruthy();
+      expect(bySegment.cells.length).toBeGreaterThan(0);
+      const segmentProfiles = new Set(ADSERVER_SEASON.segments.find(candidate => candidate.segment_id === 'household_decision_makers')!.profile_ids);
+      for (const cell of bySegment.cells) expect(segmentProfiles.has(cell.profile_id), cell.profile_id).toBe(true);
+      expect(new Set(bySegment.cells.map((cell: Structured) => cell.profile_id))).toEqual(segmentProfiles);
+      expect(bySegment.cells[0].delivered_rates).toBeDefined();
+
+      const byPlace = truth.packages.find((pkg: Structured) => pkg.package_id === placeBuy.packages[0].package_id);
+      expect(byPlace.cells.length).toBeGreaterThan(0);
+      for (const cell of byPlace.cells) expect(cell.region_id).toBe('us_west');
+
+      const dates = truth.cell_daily_actuals.map((row: Structured) => row.date) as string[];
+      expect(dates.length).toBeGreaterThan(0);
+      expect(dates.every(date => date <= truth.processed_through_date)).toBe(true);
+      expect(truth.cell_index.length).toBeGreaterThan(0);
+
+      const before = await controller(token, 'sandbox_clock', { operation: 'get' });
+      const again = await controller(token, 'simulation_truth', {});
+      expect(again.cell_daily_actuals).toBeUndefined();
+      expect(again.cell_index).toBeUndefined();
+      const after = await controller(token, 'sandbox_clock', { operation: 'get' });
+      expect(after.simulated.simulated_now).toBe(before.simulated.simulated_now);
+
+      const filtered = await controller(token, 'simulation_truth', { media_buy_ids: [placeBuy.media_buy_id] });
+      expect(filtered.packages.map((pkg: Structured) => pkg.media_buy_id)).toEqual([placeBuy.media_buy_id]);
+      const missing = await controller(token, 'simulation_truth', { media_buy_ids: ['no_such_buy'] });
+      expect(missing.success).toBe(false);
+      expect(missing.error).toBe('NOT_FOUND');
+
+      for (const bad of [{ start_date: '2026-02-30' }, { end_date: '2026-13-01' }, { start_date: '2026-12-10', end_date: '2026-12-01' }]) {
+        const refusedDates = await controller(token, 'simulation_truth', { include: ['cell_daily_actuals'], ...bad });
+        expect(refusedDates.success, JSON.stringify(bad)).toBe(false);
+        expect(refusedDates.error).toBe('INVALID_PARAMS');
+      }
+    });
+
+    it('limits daily actuals to 92 days and a response to 200 packages', async () => {
+      const token = 'demo-truth-limits-v1';
+      await provision(token);
+      const many = await book(token, 'many-000000001', Array.from({ length: 201 }, () => ({
+        product_id: 'ros_display_guaranteed', pricing_option_id: 'ros_display_guaranteed_cpm', budget: 10, impressions: 1000,
+      })));
+      expectCanonicalAll('create_media_buy', many);
+      const advanced = await advanceTo(token, '2027-04-01T00:00:00Z');
+      expect(advanced.success).toBe(true);
+
+      const crowded = await controller(token, 'simulation_truth', {});
+      expect(crowded.success).toBe(false);
+      expect(crowded.error).toBe('INVALID_PARAMS');
+      expect(crowded.error_detail).toContain('media_buy_ids');
+
+      const wide = await controller(token, 'simulation_truth', { media_buy_ids: [], include: ['cell_daily_actuals'], start_date: '2026-11-25', end_date: '2027-03-01' });
+      expect(wide.success).toBe(false);
+      expect(wide.error).toBe('INVALID_PARAMS');
+      const malformed = await controller(token, 'simulation_truth', { media_buy_ids: [], start_date: 'tomorrow', end_date: '2026-12-01' });
+      expect(malformed.error).toBe('INVALID_PARAMS');
+      expect(malformed.error_detail).toContain('params.start_date must be a YYYY-MM-DD date');
+      const reversed = await controller(token, 'simulation_truth', { media_buy_ids: [], start_date: '2026-12-02', end_date: '2026-12-01' });
+      expect(reversed.error).toBe('INVALID_PARAMS');
+      expect(reversed.error_detail).toContain('must not be after');
+      const exact = await controller(token, 'simulation_truth', { media_buy_ids: [], include: ['cell_daily_actuals'], start_date: '2026-12-01', end_date: '2027-03-02' });
+      expect(exact.success, JSON.stringify(exact).slice(0, 300)).toBe(true);
+      expect(exact.cell_daily_actuals).toHaveLength(92);
+      const dflt = await controller(token, 'simulation_truth', { media_buy_ids: [], include: ['cell_daily_actuals'] });
+      expect(dflt.cell_daily_actuals).toHaveLength(92);
+      expect(dflt.cell_daily_actuals.at(-1).date).toBe('2027-03-31');
+    });
+
+    it('keeps its fields off every AdCP read', async () => {
+      const token = 'demo-truth-leak-v1';
+      await provision(token);
+      const created = await book(token, 'leak-0000000001', [{
+        product_id: 'ros_display_guaranteed', pricing_option_id: 'ros_display_guaranteed_cpm', budget: 2000, impressions: 100_000,
+      }]);
+      await advanceTo(token, new Date(truthEnd.getTime() + DAY_MS).toISOString());
+      const truth = await controller(token, 'simulation_truth', { include: ['cell_daily_actuals'] });
+      expect(truth.success).toBe(true);
+
+      const reads = [
+        await call(tenant, 'get_products', { buying_mode: 'wholesale', account: ACCOUNT, brand: BRAND }, token),
+        await call(tenant, 'get_media_buys', { account: ACCOUNT, media_buy_ids: [created.media_buy_id] }, token),
+        await call(tenant, 'get_media_buy_delivery', { account: ACCOUNT, media_buy_ids: [created.media_buy_id] }, token),
+        await call(tenant, 'get_adcp_capabilities', {}, token),
+      ];
+      for (const read of reads) {
+        const text = JSON.stringify(read);
+        for (const field of ['profile_id', 'cells', 'rate_multipliers', 'delivered_rates', 'cell_daily_actuals']) {
+          expect(text, field).not.toContain(field);
+        }
+      }
+    });
+
+    it('answers the place resolver per its schema, and only for the ad server', async () => {
+      const resolver = `${baseUrl}/inventory-adserver/geo-places`;
+      const byQuery = await fetch(`${resolver}?q=west&country=US`);
+      expect(byQuery.status).toBe(200);
+      const body = await byQuery.json() as Structured;
+      expect(body.system).toBe(placeSystem());
+      expect(body.system_version).toBe('1');
+      expect(body.matches).toEqual([expect.objectContaining({ value: 'us_west', country: 'US', place_type: placeType(placeSystem()) })]);
+
+      const byValue = await (await fetch(`${resolver}?value=ca&country=CA`)).json() as Structured;
+      expect(byValue.matches.map((match: Structured) => match.value)).toEqual(['ca']);
+      const none = await (await fetch(`${resolver}?value=ca&country=US`)).json() as Structured;
+      expect(none.matches).toEqual([]);
+
+      const bad = await fetch(`${resolver}?country=US`);
+      expect(bad.status).toBe(400);
+      expect(await bad.json()).toEqual({ error: expect.any(String) });
+
+      expect((await fetch(`${baseUrl}/inventory-content/geo-places?q=west&country=US`)).status).toBe(404);
+    });
+
+    it('declares geo_places on the ad server, and not on the content tenant', async () => {
+      const token = 'demo-truth-capabilities-v1';
+      await provision(token);
+      const capabilities = await call(tenant, 'get_adcp_capabilities', {}, token);
+      expectCanonicalAll('get_adcp_capabilities', capabilities);
+      const targeting = capabilities.media_buy.execution.targeting;
+      expect(targeting.geo_countries).toBe(true);
+      const system = placeSystem();
+      expect(targeting.geo_places[system].countries).toEqual({ US: [placeType(system)], CA: [placeType(system)] });
+      expect(targeting.geo_places[system].catalog).toEqual({
+        current_version: '1',
+        supported_versions: ['1'],
+        resolver: { url: expect.stringMatching(/^https:\/\/.*\/inventory-adserver\/geo-places$/), auth: 'none', protocol: 'adcp_geo_place_resolver_v1' },
+      });
+
+      const content = await call('inventory-content', 'get_adcp_capabilities', {}, token);
+      expect(content.media_buy?.execution?.targeting?.geo_places).toBeUndefined();
+    });
+
+    it('serves a sports-fans package ahead of run-of-site demand, which then falls short of its goal', async () => {
+      const token = 'demo-truth-tension-v1';
+      await provision(token);
+      const impressionsFor = async (productId: string, rateCpm: number) => {
+        const mid = await productMid(token, productId);
+        return { product_id: productId, pricing_option_id: `${productId}_cpm`, impressions: mid, budget: Math.ceil((mid * rateCpm) / 1000) + 1 };
+      };
+      const sports = await book(token, 'tension-sports-01', [await impressionsFor('sports_fans_display_guaranteed', 12)]);
+      expectCanonicalAll('create_media_buy', sports);
+      const ros = await book(token, 'tension-ros-00001', [await impressionsFor('ros_display_guaranteed', 9)]);
+      expectCanonicalAll('create_media_buy', ros);
+
+      await advanceTo(token, new Date(truthEnd.getTime() + DAY_MS).toISOString());
+      const truth = await controller(token, 'simulation_truth', {});
+      const rosTruth = truth.packages.find((pkg: Structured) => pkg.package_id === ros.packages[0].package_id);
+      const sportsProfiles = new Set(ADSERVER_SEASON.segments.find(candidate => candidate.segment_id === 'sports_fans')!.profile_ids);
+      const total = rosTruth.cells.reduce((sum: number, cell: Structured) => sum + cell.impressions, 0);
+      const sportsShare = rosTruth.cells
+        .filter((cell: Structured) => sportsProfiles.has(cell.profile_id))
+        .reduce((sum: number, cell: Structured) => sum + cell.impressions, 0);
+      expect(total).toBeGreaterThan(0);
+      expect(sportsShare / total).toBeLessThan(0.1);
+      expect(total).toBeLessThan(rosTruth.impression_goal);
     });
   });
 
