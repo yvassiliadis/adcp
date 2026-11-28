@@ -22,14 +22,14 @@ Both play the *inventory* role from [#8993](https://github.com/adcontextprotocol
 
 Authenticate with the same bearer tokens as the rest of the test agent; see the [quickstart](/docs/quickstart). Each tenant serves the media buy and creative tasks as they are, with no new tasks:
 
-- [`get_products`](/docs/media-buy/task-reference/get_products) returns each product with a `forecast` for the flight in `filters.start_date` and `filters.end_date` (30 days from now when omitted). `filters.countries` narrows the forecast. `filters.delivery_type` and `filters.channels` filter the products. Both `brief` and `wholesale` buying modes are served, so a storefront can read either tenant as a wholesale catalogue.
+- [`get_products`](/docs/media-buy/task-reference/get_products) returns each product with a `forecast` for the flight in `filters.start_date` and `filters.end_date` (30 days from now when omitted). `targeting_overlay` and `filters.countries` narrow the forecast, and a product with no inventory under them is left out. See [Targeting](#targeting). `filters.delivery_type` and `filters.channels` filter the products. Both `brief` and `wholesale` buying modes are served, so a storefront can read either tenant as a wholesale catalogue.
 - [`create_media_buy`](/docs/media-buy/task-reference/create_media_buy) books each package:
   - Guaranteed packages take `impressions` as their goal. Without it, the goal is what the budget buys at the fixed price. A goal larger than the impressions available for the package's flight and targeting, net of your other bookings, fails with [`PRODUCT_UNAVAILABLE`](/docs/building/verification/compliance-catalog#error-code-product-unavailable). The error names the goal and what is available. It is never capped. That figure is the `mid` impressions of a `get_products` forecast for the same flight and countries, requested with your account and without `budget_range`.
   - The takeover and the sponsorships take every impression of what they cover, whatever the budget. So one live booking sells the takeover for each day of its flight, and a sponsorship for each installment in it. Another booking of those days or installments fails with [`PRODUCT_UNAVAILABLE`](/docs/building/verification/compliance-catalog#error-code-product-unavailable) until that one is cancelled, which frees them. Your token's buys under every account share one market, so they compete with each other.
   - Auction packages bid `bid_price`, first-price, above the floor.
-  - `targeting_overlay.geo_countries` (`US`, `CA`) narrows a package.
+  - `targeting_overlay` narrows a package by country, place or segment. See [Targeting](#targeting).
   - A package's `creatives` (uploaded inline) and `creative_assignments` (from your library) are assigned to it.
-- [`update_media_buy`](/docs/media-buy/task-reference/update_media_buy) pauses, resumes and cancels a buy or a package, and changes a package's `budget`, `impressions` or `bid_price`, or the buy's `end_time`. Raising `impressions` is checked the same way, against what the rest of the package's flight has available once the whole request is applied. Lowering it always succeeds. Cancelling the buy ignores the request's other fields, and cancelling a package ignores that package's other fields. A package's `creatives` or `creative_assignments` replace its assignments.
+- [`update_media_buy`](/docs/media-buy/task-reference/update_media_buy) pauses, resumes and cancels a buy or a package, and changes a package's `budget`, `impressions` or `bid_price`, or the buy's `end_time`. Raising `impressions` is checked the same way, against what the rest of the package's flight has available once the whole request is applied. Lowering it always succeeds. Cancelling the buy ignores the request's other fields, and cancelling a package ignores that package's other fields. It does not change a package's targeting. A package's `creatives` or `creative_assignments` replace its assignments.
 - [`get_media_buys`](/docs/media-buy/task-reference/get_media_buys) and [`get_media_buy_delivery`](/docs/media-buy/task-reference/get_media_buy_delivery) report what was booked and what was delivered. They include `by_package`, `daily_breakdown` and `pacing_index` for guaranteed packages. In `get_media_buys`, each package lists its `creative_approvals`.
 - [`sync_creatives`](/docs/creative/task-reference/sync_creatives), [`list_creatives`](/docs/creative/task-reference/list_creatives) and [`list_creative_formats`](/docs/creative/task-reference/list_creative_formats) manage the creatives you traffic your buys with. See [Creatives](#creatives).
 
@@ -45,6 +45,101 @@ Both tenants keep a creative library for each account. Sync creatives to it with
 - **Assignments.** `assignment_operations` supports `assign`, `unassign` and `replace`. A request's operations apply together or not at all. The deprecated `assignments` field still works, and reports each failed assignment in the creative's `assignment_errors`. Merges, assignment-level trackers and landing pages, installment scoping and placement routing are rejected with [`UNSUPPORTED_FEATURE`](/docs/building/verification/compliance-catalog#error-code-unsupported-feature).
 - **Review and delivery.** Every creative is approved as soon as it arrives. A buy reports `pending_creatives` while none of its live packages has a creative, then `pending_start` or `active` as usual. Delivery does not wait for a creative, though: an unassigned package delivers as the simulation's actual traffic dictates. The creatives exist to test trafficking, not to gate serving.
 - **Scope.** Creatives are private to the account that synced them, like the buys they are assigned to. Each account holds up to 200 creatives of up to 32 KiB each; reference hosted media by URL. `reset_state` clears them with the rest of your market.
+
+## Targeting
+
+A package's `targeting_overlay` can name countries, places and segments. The season's geography is four sales regions, and its audiences are segments of audience profiles:
+
+| Region | Country |
+|--------|---------|
+| `us_northeast`, `us_south`, `us_west` | `US` |
+| `ca` | `CA` |
+
+The ad server's segments are `sports_fans`, `household_decision_makers` and `news_loyalists`. Each is a set of audience profiles, which the traffic carries per region.
+
+Every field you send is checked. A targeting field a product does not support is refused by name with [`UNSUPPORTED_FEATURE`](/docs/building/verification/compliance-catalog#error-code-unsupported-feature), and is never ignored. That includes `property_list`, `device_platform` and the other overlay fields these tenants do not serve. Malformed values, an unknown region or segment, and a field in both its include and exclude form fail with [`INVALID_REQUEST`](/docs/building/verification/compliance-catalog#error-code-invalid-request) and the path of the field. Values that are valid but leave no inventory in the product, such as `geo_countries: ["GB"]`, fail with [`PRODUCT_UNAVAILABLE`](/docs/building/verification/compliance-catalog#error-code-product-unavailable).
+
+### Countries
+
+`geo_countries` and `geo_countries_exclude` take ISO 3166-1 alpha-2 codes (`US`, `CA`). Lowercase codes are accepted and returned in uppercase. Every product takes them.
+
+### Places
+
+`geo_places` and `geo_places_exclude` take sales regions as places. Each entry names a `country`, a place `system`, a `place_type` and the region ids as `values`:
+
+```json
+{
+  "geo_places": [
+    {
+      "country": "US",
+      "system": "https://adcontextprotocol.org/training-agent/places",
+      "place_type": "https://adcontextprotocol.org/training-agent/places/types/sales-region",
+      "values": ["us_northeast", "us_west"]
+    }
+  ]
+}
+```
+
+- The `system` is the server's `TRAINING_AGENT_INVENTORY_PLACE_SYSTEM` setting, `https://adcontextprotocol.org/training-agent/places` by default. The `place_type` is the system followed by `/types/sales-region`.
+- The `values` are region ids. A region in a different country from the entry's `country` fails with `INVALID_REQUEST`.
+- The catalogue is at version `"1"`. A `system_version` other than `"1"` fails with `INVALID_REQUEST`. Packages echo it as `"1"` when you leave it out.
+- A different `system`, `place_type` or country is refused with `UNSUPPORTED_FEATURE`.
+- Countries and places combine: a package takes the regions in both its countries and its places, less its exclusions.
+
+The ad server advertises its place system in [`get_adcp_capabilities`](/docs/protocol/get_adcp_capabilities), with a resolver. The resolver is a public `GET` that needs no authentication:
+
+```
+GET https://test-agent.adcontextprotocol.org/inventory-adserver/geo-places?country=US&q=west
+```
+
+- Send `country` and exactly one of `q` (a case-insensitive match on a region's name or id) or `value` (an exact region id).
+- `subdivision`, `place_type`, `system_version` and `limit` (1 to 100, default 20) are optional. Matches come back in one page.
+- It returns `system`, `system_version`, the echoed `request` and `matches`. Each match has `value`, `country`, `place_type`, `label`, `canonical_name`, `parent_labels` and `status`.
+- A bad query returns `400` with `{ "error": "..." }`.
+
+### Segments
+
+A segment is a signal that belongs to a product: a `signal_ref` with `scope` `product` and the segment id as `signal_id`. Each product that takes segments lists the ones it offers in `signal_targeting_options`. The takeover and the content products declare none. A product's own segment is in `included_signals` instead, because it already sells to it. Segments are binary, so `value` is always `true`.
+
+`signal_targeting_groups` has an `operator` of `all` over groups. A group with `any` keeps the audience in at least one of its segments. A group with `none` removes the audience in any of its segments:
+
+```json
+{
+  "signal_targeting_groups": {
+    "operator": "all",
+    "groups": [
+      {
+        "operator": "any",
+        "signals": [
+          { "signal_ref": { "scope": "product", "signal_id": "household_decision_makers" }, "value_type": "binary", "value": true }
+        ]
+      },
+      {
+        "operator": "none",
+        "signals": [
+          { "signal_ref": { "scope": "product", "signal_id": "news_loyalists" }, "value_type": "binary", "value": true }
+        ]
+      }
+    ]
+  }
+}
+```
+
+An unknown segment id fails with `INVALID_REQUEST`. A known segment the product does not offer (including the product's own segment, or any segment on a product that takes countries only) is refused with `UNSUPPORTED_FEATURE`. Groups that leave no audience fail with `PRODUCT_UNAVAILABLE`.
+
+### Which products take what
+
+- Every product takes `geo_countries` and `geo_countries_exclude`.
+- Products with no `share_of_voice` and no collections also take places and segments. On the ad server, that is every product except the homepage takeover. The content platform takes countries only.
+- Each product states this in its `overlay_support`. Send `required_overlay_support` to [`get_products`](/docs/media-buy/task-reference/get_products) to keep only the products that cover it.
+
+### Forecasts and bookings
+
+`get_products` takes a request-level `targeting_overlay` and forecasts each product for it, together with `filters.countries`. A product that cannot serve the overlay is left out of the response, rather than failing the call. An overlay that is malformed fails the whole call with `INVALID_REQUEST`.
+
+[`create_media_buy`](/docs/media-buy/task-reference/create_media_buy) applies each package's overlay to what that package books, delivers and reports, and returns it on the package. A package whose targeting is refused fails the request.
+
+[`update_media_buy`](/docs/media-buy/task-reference/update_media_buy) does not change targeting. A `targeting_overlay` on a package change is refused with `UNSUPPORTED_FEATURE`, naming `packages[i].targeting_overlay`. To change it, cancel the package and book another.
 
 ## Move the clock
 
@@ -68,7 +163,7 @@ Every time-dependent behaviour of these tenants reads your *sandbox clock*. Unti
 - `reset_state` on either inventory tenant unpins the clock and discards your buys on both. A `reset_state` elsewhere that unpins the clock, such as `/sales/mcp`'s, also leaves your inventory buys behind: a market that has run days the clock has not reached starts fresh.
 - You have one clock per credential. It is the same clock that `reporting_subscription_probe` `advance_time` moves on `/sales/mcp`, so moving it on either tenant moves it for both.
 
-Both tenants list `sandbox_clock`, `reset_state` and the seeds below in `list_scenarios` and in `compliance_testing.scenarios`.
+Both tenants list `sandbox_clock`, `simulation_truth`, `reset_state` and the seeds below in `list_scenarios` and in `compliance_testing.scenarios`.
 
 ### Test controller seeds
 
@@ -79,6 +174,36 @@ A storyboard's fixtures are seeded through the same controller, so the media-buy
 - `seed_pricing_option` prices a seeded product. A `floor_price` is the lowest bid an auction booking places, and a `fixed_price` is a guaranteed booking's rate. A seeded product with no seeded pricing option is priced like the season's own products.
 
 Seeded products are private to your credential, like your buys. A credential that never seeds sees only the season's products. `reset_state` discards your seeds with the rest of your market.
+
+## Read the simulation's truth
+
+`simulation_truth` returns what your simulated market actually did, for scoring a buyer or checking a forecast against its source. It reads only days that have already run, and never forecasts. It is a [`comply_test_controller`](/docs/building/by-layer/L3/comply-test-controller) scenario on a sandbox account, never an AdCP read, and it changes nothing, not even the clock.
+
+```json
+{
+  "scenario": "simulation_truth",
+  "params": {
+    "media_buy_ids": ["mb_0001"],
+    "include": ["cell_daily_actuals"],
+    "start_date": "2027-01-01",
+    "end_date": "2027-01-31"
+  }
+}
+```
+
+- `media_buy_ids` limits the response to those buys. Without it, it covers all your buys on the tenant. More than 200 packages fails with `INVALID_PARAMS`; narrow it with `media_buy_ids`. An unknown id fails with `NOT_FOUND`.
+- `include` can list `cell_daily_actuals`. Without it, the response has no daily data.
+- `start_date` and `end_date` (`YYYY-MM-DD`, both inclusive) bound the daily actuals. Days that have not run yet are left out. The default is the last 92 processed days, and a window is at most 92 days. The 92-day limit applies to the window after it is clamped to processed days. A longer window, a reversed one (start after end), or a malformed or impossible date fails with `INVALID_PARAMS`.
+- A request on an account that is not a sandbox fails with `FORBIDDEN`.
+
+The response has:
+
+- `seed_id`, `season_fingerprint`, `engine_version`, `simulated_now` and `processed_through_date`, the last day that ran. `processed_through_date` is absent until a day has run. `seed_id`, `season_fingerprint` and `engine_version` are the same values `sandbox_clock` reports in its `simulated` block, so a score can record which season and engine it ran against.
+- `world`: the `regions` with their traffic `share`, the audience profiles with their `share` and `rate_multipliers`, and the `segments` with their `profile_ids`.
+- `packages`: for each package, its `package_id`, `media_buy_id`, `account_id`, `product_id`, `kind`, `status`, `impression_goal` (guaranteed packages), `cpm` and the `targeting` it booked as region and profile ids, with what it `delivered`. Its `cells` break delivery down by region, property, placement and audience profile. Each cell has the `rates` it is drawn around and the `delivered_rates` the package saw.
+- With `cell_daily_actuals`: a `cell_index` that labels each cell by `cell_id`, and `cell_daily_actuals`, one entry per day: `[{ "date": "2027-01-01", "actuals": [[cell_id, impressions], ...] }]`.
+
+The cells are the simulation's own, so an oracle can compare a forecast, a delivery report or a buyer's own estimate to the rates that generated them.
 
 ## What happens each simulated day
 

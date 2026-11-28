@@ -799,6 +799,13 @@ export class SeasonTraffic {
     return product;
   }
 
+  /** Profile ids that make up a segment. */
+  profilesOfSegment(segmentId: string): string[] {
+    const members = this.segmentProfiles.get(segmentId);
+    if (!members) throw new EngineError('INVALID_TARGETING', `Unknown segment ${segmentId}`);
+    return [...members];
+  }
+
   /** Installments a product sells: those of its collections. */
   productInstallments(productId: string): Installment[] {
     const collections = new Set(this.requireProduct(productId).collection_ids ?? []);
@@ -808,7 +815,9 @@ export class SeasonTraffic {
   /**
    * Cells a product covers under the given targeting, as sorted slot
    * indices. Segments are unions of profiles, so a profile in two targeted
-   * segments is counted once.
+   * segments is counted once. `profile_ids` intersects with the segments and
+   * the product's segment; a defined empty `profile_ids` or `region_ids`
+   * matches nothing.
    */
   eligibleCells(productId: string, targeting: BookingTargeting = {}): number[] {
     const product = this.requireProduct(productId);
@@ -824,12 +833,16 @@ export class SeasonTraffic {
         for (const profile of members) profiles.add(profile);
       }
     }
+    const requestedProfiles = targeting.profile_ids ? new Set(targeting.profile_ids) : undefined;
+    for (const id of requestedProfiles ?? []) {
+      if (!this.profiles.has(id)) throw new EngineError('INVALID_TARGETING', `Unknown profile ${id}`);
+    }
     const productProfiles = product.segment_id ? this.segmentProfiles.get(product.segment_id)! : undefined;
     const productInstallments = new Set(this.productInstallments(productId).map(installment => installment.installment_id));
     for (const id of targeting.installment_ids ?? []) {
       if (!productInstallments.has(id)) throw new EngineError('INVALID_TARGETING', `Product ${productId} does not sell installment ${id}`);
     }
-    const regions = targeting.region_ids && targeting.region_ids.length > 0 ? new Set(targeting.region_ids) : undefined;
+    const regions = targeting.region_ids ? new Set(targeting.region_ids) : undefined;
     const installments = targeting.installment_ids && targeting.installment_ids.length > 0 ? new Set(targeting.installment_ids) : undefined;
     const placements = new Set(product.placement_ids);
     const propertyIds = product.property_ids ? new Set(product.property_ids) : undefined;
@@ -838,6 +851,7 @@ export class SeasonTraffic {
         && (!propertyIds || propertyIds.has(slot.property_id))
         && (!productProfiles || productProfiles.has(slot.profile_id))
         && (!profiles || profiles.has(slot.profile_id))
+        && (!requestedProfiles || requestedProfiles.has(slot.profile_id))
         && (!regions || regions.has(slot.region_id))
         && (!slot.installment_id || (productInstallments.has(slot.installment_id)
           && (!installments || installments.has(slot.installment_id)))))
