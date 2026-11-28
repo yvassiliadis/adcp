@@ -1033,6 +1033,24 @@ describe('inventory tenants', () => {
       }
     });
 
+    it('returns a response that matches the comply_test_controller schema', async () => {
+      const token = 'demo-truth-schema-v1';
+      await provision(token);
+      const bought = await book(token, 'schema-0000000001', [{
+        product_id: 'ros_display_guaranteed', pricing_option_id: 'ros_display_guaranteed_cpm', budget: 2000, impressions: 100_000,
+      }]);
+      expectCanonicalAll('create_media_buy', bought);
+      const advanced = await advanceTo(token, new Date(truthEnd.getTime() + DAY_MS).toISOString());
+      expect(advanced.success).toBe(true);
+
+      const summary = await controller(token, 'simulation_truth', {});
+      expect(summary.success).toBe(true);
+      expectCanonicalAll('comply_test_controller', summary);
+      const detailed = await controller(token, 'simulation_truth', { include: ['cell_daily_actuals'], start_date: truthStart.toISOString().slice(0, 10), end_date: truthEnd.toISOString().slice(0, 10) });
+      expect(detailed.cell_daily_actuals.length).toBeGreaterThan(0);
+      expectCanonicalAll('comply_test_controller', detailed);
+    });
+
     it('limits daily actuals to 92 days and a response to 200 packages', async () => {
       const token = 'demo-truth-limits-v1';
       await provision(token);
