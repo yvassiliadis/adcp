@@ -13,6 +13,7 @@ import {
   type SeasonSeed,
   type SeedProduct,
 } from '../../src/training-agent/inventory-sim/engine/index.js';
+import { TRAINING_AGENT_HOSTED_PREVIEW } from '../../src/training-agent/candidate-version.js';
 import {
   PLACE_CATALOG_VERSION,
   TargetingError,
@@ -168,6 +169,44 @@ describe('parseOverlay: countries and places', () => {
   });
 });
 
+/** Every overlay dimension the tenants do not take, each with a well-formed value. Earlier servers ignored these; the parser now refuses each by name. */
+const UNSUPPORTED_DIMENSIONS: Record<string, unknown> = {
+  geo_regions: ['US-CA'],
+  geo_regions_exclude: ['US-NY'],
+  geo_metros: [{ system: 'nielsen_dma', values: ['501'] }],
+  geo_metros_exclude: [{ system: 'nielsen_dma', values: ['501'] }],
+  geo_postal_areas: [{ system: 'us_zip', values: ['10001'] }],
+  geo_postal_areas_exclude: [{ system: 'us_zip', values: ['10001'] }],
+  daypart_targets: [{ days: ['monday'], start_hour: 9, end_hour: 17 }],
+  axe_include_segment: 'segment_a',
+  axe_exclude_segment: 'segment_b',
+  audience_exclude: [{ audience_id: 'a' }],
+  demographics: { age_range: { min: 18, max: 34 } },
+  frequency_cap: { max_impressions: 3, per: 1, window: { interval: 1, unit: 'days' } },
+  property_list: { agent_url: 'https://lists.example', list_id: 'list_a' },
+  property_list_exclude: { agent_url: 'https://lists.example', list_id: 'list_b' },
+  collection_list: { agent_url: 'https://lists.example', list_id: 'list_c' },
+  collection_list_exclude: { agent_url: 'https://lists.example', list_id: 'list_d' },
+  collection_lists: [{ agent_url: 'https://lists.example', list_id: 'list_e' }],
+  collection_lists_exclude: [{ agent_url: 'https://lists.example', list_id: 'list_f' }],
+  placement_selection: { placement_ids: ['banner'] },
+  collection_selection: { collection_ids: ['morning_brief'] },
+  age_restriction: { min: 21 },
+  device_platform_exclude: ['android'],
+  device_type: ['mobile'],
+  device_type_exclude: ['desktop'],
+  browser: ['chrome'],
+  browser_exclude: ['safari'],
+  store_catchments: [{ catchment_id: 'store_1' }],
+  geo_proximity: [{ latitude: 40.7, longitude: -74, radius: { value: 5, unit: 'km' } }],
+  language: ['en'],
+  keyword_targets: [{ keyword: 'running shoes', match_type: 'broad' }],
+  negative_keywords: [{ keyword: 'free', match_type: 'exact' }],
+};
+/** Dimensions the table below already pins on their own rows, or that the parser takes. */
+const PINNED_ELSEWHERE = ['device_platform', 'audience_include', 'signal_targeting'];
+const SUPPORTED_DIMENSIONS = ['geo_countries', 'geo_countries_exclude', 'geo_value_labels', 'geo_places', 'geo_places_exclude', 'signal_targeting_groups'];
+
 describe('parseOverlay: refusals', () => {
   const cases: Array<[string, unknown, SeedProduct, string, string]> = [
     ['a non-object overlay', 'US', full, 'INVALID_REQUEST', PREFIX],
@@ -200,6 +239,8 @@ describe('parseOverlay: refusals', () => {
     ['a dimension the product does not support', { device_platform: ['ios'] }, full, 'UNSUPPORTED_FEATURE', `${PREFIX}.device_platform`],
     ['audience_include', { audience_include: [{ audience_id: 'a' }] }, full, 'UNSUPPORTED_FEATURE', `${PREFIX}.audience_include`],
     ['the deprecated signal_targeting', { signal_targeting: [] }, full, 'UNSUPPORTED_FEATURE', `${PREFIX}.signal_targeting`],
+    ...Object.entries(UNSUPPORTED_DIMENSIONS).map(([key, value]): [string, unknown, SeedProduct, string, string] =>
+      [`${key}, which earlier servers ignored`, { [key]: value }, full, 'UNSUPPORTED_FEATURE', `${PREFIX}.${key}`]),
     ['places on a countries product', { geo_places: [place(['us_west'])] }, takeover, 'UNSUPPORTED_FEATURE', `${PREFIX}.geo_places`],
     ['place exclusion on a countries product', { geo_places_exclude: [place(['us_west'])] }, takeover, 'UNSUPPORTED_FEATURE', `${PREFIX}.geo_places_exclude`],
     ['signals on a countries product', { signal_targeting_groups: groups(['any', ['news_loyalists']]) }, takeover, 'UNSUPPORTED_FEATURE', `${PREFIX}.signal_targeting_groups`],
@@ -220,6 +261,26 @@ describe('parseOverlay: refusals', () => {
     const error = refusal(() => parseOverlay(overlay, seed, target, PREFIX));
     expect({ code: error.code, field: error.field }).toEqual({ code, field });
     expect(error.message.length).toBeGreaterThan(0);
+  });
+
+  describe('the hosted preview targeting schema', () => {
+    const schema = JSON.parse(readFileSync(join(process.cwd(), 'node_modules/@adcp/sdk/dist/lib/schemas-data', TRAINING_AGENT_HOSTED_PREVIEW.bundle, 'core/targeting.json'), 'utf8'));
+    const covered = [...Object.keys(UNSUPPORTED_DIMENSIONS), ...PINNED_ELSEWHERE, ...SUPPORTED_DIMENSIONS];
+
+    it('has a row for every dimension the parser does not take', () => {
+      expect(Object.keys(schema.properties).filter(key => !covered.includes(key))).toEqual([]);
+    });
+
+    it('has a dimension for every row, so a mistyped row cannot pass', () => {
+      expect(covered.filter(key => !(key in schema.properties))).toEqual([]);
+    });
+  });
+
+  it('refuses an unsupported dimension on every product, a takeover and a sponsorship included', () => {
+    for (const target of [full, takeover, content]) {
+      const error = refusal(() => parseOverlay({ frequency_cap: UNSUPPORTED_DIMENSIONS.frequency_cap }, seed, target, PREFIX));
+      expect({ code: error.code, field: error.field }).toEqual({ code: 'UNSUPPORTED_FEATURE', field: `${PREFIX}.frequency_cap` });
+    }
   });
 
   it('refuses signals on the content tenant as unsupported, though they are globally valid', () => {

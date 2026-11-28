@@ -874,6 +874,27 @@ describe('inventory tenants', () => {
       expect(after.media_buys[0].packages[0].paused).toBe(false);
     });
 
+    it('refuses the overlay fields earlier servers ignored, naming each', async () => {
+      const token = 'demo-targeting-ignored-v1';
+      await provision(token);
+      const ignored: Array<[string, Record<string, unknown>]> = [
+        ['frequency_cap', { frequency_cap: { max_impressions: 3, per: 1, window: { interval: 1, unit: 'days' } } }],
+        ['property_list', { property_list: { agent_url: 'https://lists.example', list_id: 'list_a' } }],
+        ['device_platform', { device_platform: ['ios'] }],
+        ['audience_include', { audience_include: [{ audience_id: 'a' }] }],
+      ];
+      let attempt = 0;
+      for (const [field, overlay] of ignored) {
+        for (const product of ['ros_display_guaranteed', 'homepage_takeover_daily']) {
+          attempt += 1;
+          const refused = await book(token, `ignored-${String(attempt).padStart(8, '0')}`, product, overlay);
+          expect(failure(refused), `${field} on ${product}`).toMatchObject({ code: 'UNSUPPORTED_FEATURE', field: `packages[0].targeting_overlay.${field}` });
+        }
+      }
+      const listed = await call(tenant, 'get_media_buys', { account: ACCOUNT }, token);
+      expect(listed.media_buys).toEqual([]);
+    });
+
     it('filters get_products by the overlay, an unknown segment, and required_overlay_support', async () => {
       const token = 'demo-targeting-discovery-v1';
       await provision(token);
